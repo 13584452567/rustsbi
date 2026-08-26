@@ -13,6 +13,7 @@ use crate::platform::console::{
     UARTBFLB_COMPATIBLE, UARTPL011_COMPATIBLE, UARTSIFIVE_COMPATIBLE, UARTXSCALE_COMPATIBLE,
 };
 use crate::platform::reset::P1_PMIC_COMPATIBLE;
+use crate::platform::reset::RPMI_SYSRST_COMPATIBLE;
 use crate::platform::reset::SIFIVETEST_COMPATIBLE;
 use crate::sbi::features::extension_detection;
 use spin::{Once, RwLock};
@@ -233,6 +234,9 @@ pub struct BoardInfo {
     pub console: Option<(BaseAddress, MachineConsoleType)>,
     pub console_clock: Option<u32>,
     pub reset: Option<BaseAddress>,
+    /// True when the platform exposes system reset through the RPMI
+    /// System Reset service group (K3) rather than an MMIO test device.
+    pub rpmi_reset: bool,
     pub ipi: Option<(BaseAddress, MachineClintType)>,
     pub aia: Option<aia::AiaInfo>,
     pub cpu_num: Option<usize>,
@@ -248,6 +252,7 @@ impl BoardInfo {
             console: None,
             console_clock: None,
             reset: None,
+            rpmi_reset: false,
             ipi: None,
             aia: None,
             cpu_num: None,
@@ -358,6 +363,17 @@ impl BoardInfo {
         let mut find_device =
             |node: &serde_device_tree::buildin::Node,
              parent: Option<&serde_device_tree::buildin::Node>| {
+                // RPMI system reset may be described by a node without a
+                // `reg` property (K3: rpmi-mpxy-sysreset@0 has only
+                // compatible/mboxes/status), so discover it before the
+                // reg-requiring path below returns early.
+                if let Some(compatible) = node.get_prop("compatible") {
+                    let seq =
+                        compatible.deserialize::<serde_device_tree::buildin::StrSeq>();
+                    for device_id in seq.iter() {
+                        self.discover_rpmi_reset(device_id);
+                    }
+                }
                 let Some((compatible, regs)) = get_compatible_and_ranges(node) else {
                     return;
                 };
@@ -399,6 +415,18 @@ impl BoardInfo {
         // Initialize reset device.
         if SIFIVETEST_COMPATIBLE.contains(&device_id) {
             self.reset = Some(base_address);
+        }
+    }
+
+    /// Discovers the K3 RPMI system reset device from a `compatible` match.
+    ///
+    /// The K3 exposes system reset through the RPMI System Reset service
+    /// group (delivered over the shared-memory mailbox), not through a
+    /// sifive,test0-style MMIO device. We record the node so the reset
+    /// extension can be backed by the injected mailbox.
+    fn discover_rpmi_reset(&mut self, device_id: &str) {
+        if RPMI_SYSRST_COMPATIBLE.contains(&device_id) {
+            self.rpmi_reset = true;
         }
     }
 
@@ -720,6 +748,11 @@ fn print_reset_info() {
         info!(
             "{:<30}: Available (P1 PMIC @ 0x{:02x}, I2C Base: 0x{:x})",
             "Platform Reset Extension", pmic_addr, i2c_base
+        );
+    } else if board_info().rpmi_reset {
+        info!(
+            "{:<30}: Available (RPMI System Reset service group)",
+            "Platform Reset Extension"
         );
     } else {
         warn!("{:<30}: Not Available", "Platform Reset Device");

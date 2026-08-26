@@ -94,6 +94,11 @@ impl SbiMpxy {
         *self.mailbox.lock() = Some(mailbox);
     }
 
+    /// Returns the injected mailbox backend, if any.
+    pub(crate) fn mailbox(&self) -> Option<&'static RpmiMailbox> {
+        *self.mailbox.lock()
+    }
+
     /// Returns whether the given channel ID is exposed.
     fn is_channel(&self, channel_id: u32) -> bool {
         CHANNELS.iter().any(|&id| id as u32 == channel_id)

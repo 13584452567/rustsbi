@@ -3,6 +3,10 @@ use sifive_test_device::SifiveTestDevice;
 
 use crate::sbi::reset::ResetDevice;
 pub(crate) const SIFIVETEST_COMPATIBLE: [&str; 1] = ["sifive,test0"];
+/// K3 reset is exposed as an RPMI System Reset service group via the
+/// `riscv,rpmi-shmem-mbox` node; the DTB marks it with
+/// `riscv,rpmi-system-reset` (mirrors OpenSBI `fdt_reset_rpmi.c`).
+pub(crate) const RPMI_SYSRST_COMPATIBLE: [&str; 1] = ["riscv,rpmi-system-reset"];
 pub(crate) const P1_PMIC_COMPATIBLE: [&str; 2] = [
     "spacemit,p1",
     // Official OrangePi RV2 U-Boot (orangepi-xunlong/u-boot-orangepi,

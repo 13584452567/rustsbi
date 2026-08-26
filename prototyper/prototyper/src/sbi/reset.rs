@@ -5,6 +5,52 @@ use spin::Mutex;
 use crate::platform::BoardInfo;
 use crate::platform::reset::{P1PmicResetWrap, SifiveTestDeviceWrap};
 
+/// RPMI System Reset service group IDs (rpmi_msgprot.h
+/// `enum rpmi_sysrst_service_id` / `enum rpmi_sysrst_reset_type`).
+mod rpmi_sysrst {
+    pub const SERVICE_SYSTEM_RESET: u8 = 0x03;
+    pub const TYPE_SHUTDOWN: u8 = 0x0;
+    pub const TYPE_COLD_REBOOT: u8 = 0x1;
+    pub const TYPE_WARM_REBOOT: u8 = 0x2;
+}
+
+/// K3 system reset device: forwards SBI reset requests to the RPMI System
+/// Reset service group over the injected shared-memory mailbox (mirrors
+/// OpenSBI `fdt_reset_rpmi.c`). The mailbox is injected after the reset
+/// extension is constructed, so it is resolved lazily on each request.
+pub(crate) struct RpmiResetWrap;
+
+impl RpmiResetWrap {
+    fn do_reset(&self, reset_type: u8) -> ! {
+        if let Some(mpxy) = crate::sbi::mpxy() {
+            if let Some(mailbox) = mpxy.mailbox() {
+                let req = (reset_type as u32).to_le_bytes();
+                let _ = mailbox.posted_request(
+                    rpmi::message::servicegroup::SYSTEM_RESET,
+                    rpmi_sysrst::SERVICE_SYSTEM_RESET,
+                    &req,
+                );
+            }
+        }
+        // If the mailbox is unavailable, hang as a last resort.
+        loop {
+            core::hint::spin_loop()
+        }
+    }
+}
+
+impl ResetDevice for RpmiResetWrap {
+    fn fail(&self, _code: u16) -> ! {
+        self.do_reset(rpmi_sysrst::TYPE_SHUTDOWN)
+    }
+    fn pass(&self) -> ! {
+        self.do_reset(rpmi_sysrst::TYPE_SHUTDOWN)
+    }
+    fn reset(&self) -> ! {
+        self.do_reset(rpmi_sysrst::TYPE_COLD_REBOOT)
+    }
+}
+
 pub trait ResetDevice: Send {
     fn fail(&self, code: u16) -> !;
     fn pass(&self) -> !;
@@ -70,6 +116,12 @@ pub(crate) fn init(board: &BoardInfo) -> Option<SbiReset> {
         Some(SbiReset::new(Mutex::new(Box::new(P1PmicResetWrap::new(
             i2c_base, pmic_addr,
         )))))
+    } else if board.rpmi_reset {
+        // K3: system reset is an RPMI System Reset service-group request
+        // delivered over the shared-memory mailbox (mirrors OpenSBI
+        // `fdt_reset_rpmi.c`). The mailbox is injected later in boot, so the
+        // request is resolved lazily at reset time.
+        Some(SbiReset::new(Mutex::new(Box::new(RpmiResetWrap))))
     } else {
         None
     }
