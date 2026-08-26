@@ -9,6 +9,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Add `Fwft` trait for the SBI Firmware Features extension (chapter 18).
+- Add `Dbtr` trait for the SBI Debug Triggers extension (chapter 19).
+- Add `Sse` trait for the SBI Supervisor Software Events extension (chapter 17).
+- Add `Mpxy` trait for the SBI Message Proxy extension (chapter 20).
+- Wire the new traits (`fwft`, `dbtr`, `sse`, `mpxy`) into the `RustSBI`
+  derive macro: field-name mapping, static/dynamic dispatch arms and
+  extension probes.
+
 ### Modified
 
 - deps: update `sbi-spec` to version 0.0.10.
