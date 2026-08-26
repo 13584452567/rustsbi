@@ -23,7 +23,49 @@ pub(crate) mod clint;
 pub(crate) mod console;
 pub(crate) mod reset;
 
-pub use boot::{init_board, memory_range, secondary_hart_init, wait_until_ready};
+pub use boot::{init_board, memory_range, secondary_hart_init, wait_until_ready, wakeup_hart};
+
+/// Result of a platform access-fault emulation attempt.
+///
+/// Returned by [`emulate_access_fault`], the platform-level
+/// `emulate_load`/`emulate_store` hook (issue #237 1-a).
+pub enum AccessFaultResult {
+    /// The platform did not handle the access; re-inject the fault to S-mode.
+    NotHandled,
+    /// Emulated load: the value read from the emulated MMIO register.
+    EmulatedLoad(u64),
+    /// Emulated store succeeded.
+    EmulatedStore,
+}
+
+/// Platform-level `emulate_load`/`emulate_store` hook (issue #237 1-a).
+///
+/// Dispatches S-mode load/store access faults to the platform's MMIO
+/// emulation. On the SpacemiT K3 this is the REGISTER_PRESERVATION window
+/// emulation ([`crate::riscv::spacemit_k3::emulate_load`] /
+/// [`crate::riscv::spacemit_k3::emulate_store`], mirroring OpenSBI
+/// `spacemit_k3_emulate_load/store`); other platforms return
+/// [`AccessFaultResult::NotHandled`].
+pub(crate) fn emulate_access_fault(
+    is_load: bool,
+    addr: usize,
+    len: usize,
+    value: u64,
+) -> AccessFaultResult {
+    if !IS_K3_PLATFORM.load(Ordering::Acquire) {
+        return AccessFaultResult::NotHandled;
+    }
+    if is_load {
+        match crate::riscv::spacemit_k3::emulate_load(addr, len) {
+            Some(v) => AccessFaultResult::EmulatedLoad(v),
+            None => AccessFaultResult::NotHandled,
+        }
+    } else if crate::riscv::spacemit_k3::emulate_store(addr, len, value) {
+        AccessFaultResult::EmulatedStore
+    } else {
+        AccessFaultResult::NotHandled
+    }
+}
 
 pub(crate) static CPU_PRIVILEGED_ENABLED: [AtomicBool; NUM_HART_MAX] =
     [const { AtomicBool::new(false) }; NUM_HART_MAX];
@@ -34,6 +76,7 @@ pub(crate) static CPU_PRIVILEGED_ENABLED: [AtomicBool; NUM_HART_MAX] =
 /// secondary hart observing `READY == true` is guaranteed to also observe
 /// this flag (main.rs secondary-hart path).
 pub(crate) static IS_K1_PLATFORM: AtomicBool = AtomicBool::new(false);
+pub(crate) static IS_K3_PLATFORM: AtomicBool = AtomicBool::new(false);
 
 /// Boot synchronization flag: set by the boot hart once platform
 /// initialization is complete, spinning secondary harts observe it with

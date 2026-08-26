@@ -221,6 +221,11 @@ impl rustsbi::Hsm for SbiHsm {
                     opaque,
                     next_mode: MPP::Supervisor,
                 }) {
+                    // Platform wakeup hook (issue #237 1-d): on the SpacemiT
+                    // K3 a stopped hart may be PMU-powered-down, in which case
+                    // the MSIP interrupt alone cannot rouse it — assert the
+                    // hart's PMU wakeup register first, then raise MSIP.
+                    crate::platform::wakeup_hart(hartid);
                     crate::sbi::ipi().unwrap().set_msip(hartid);
                     SbiRet::success(0)
                 } else {
