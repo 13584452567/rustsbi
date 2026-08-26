@@ -105,6 +105,12 @@ pub fn extension_detection(cpus: &NodeSeq) {
                 Extension::Hypervisor if hart_id == current_hartid() => {
                     misa::read().has_extension('H')
                 }
+                // SpacemiT K3: `riscv,isa-extensions` in the DTB declares
+                // "ssaia" but omits "smaia", even though the hardware does
+                // implement M-level AIA (OpenSBI spacemit_k3 accesses
+                // CSR_MIREG/CSR_SIREG). Fall back to a CSR probe so the
+                // IMSIC-backed AIA path is not wrongly rejected.
+                Extension::Smaia => dt_supported || probe_smaia_csr(),
                 _ => dt_supported,
             };
         }
@@ -118,8 +124,6 @@ fn check_extension_in_device_tree(ext: &str, cpu: &crate::devicetree::Cpu) -> bo
     if let Some(isa_exts) = &cpu.isa_extensions {
         return isa_exts.iter().any(|e| e == ext);
     }
-
-    // Fallback to isa (take first string, default to empty)
     cpu.isa
         .iter()
         .next()
@@ -129,6 +133,21 @@ fn check_extension_in_device_tree(ext: &str, cpu: &crate::devicetree::Cpu) -> bo
                 .any(|part| part == ext || (ext.len() == 1 && part.contains(ext)))
         })
         .unwrap_or(false)
+}
+
+/// Probes whether M-level AIA (Smaia) is implemented by trying to read the
+/// `miselect` CSR (0x350). SpacemiT K3's DTB omits "smaia" from
+/// `riscv,isa-extensions` even though the hardware implements it (OpenSBI
+/// spacemit_k3 accesses CSR_MIREG/CSR_SIREG), so the DT check alone would
+/// wrongly reject the IMSIC-backed AIA path on K3.
+fn probe_smaia_csr() -> bool {
+    let mut trap_info = TrapInfo::default();
+    unsafe {
+        // miselect (0x350) is an M-level AIA selector CSR. If it does not
+        // exist, the expected-trap handler records mcause != usize::MAX.
+        csr_read_allow::<0x350>(&mut trap_info);
+        trap_info.mcause == usize::MAX
+    }
 }
 
 fn privileged_version_detection() {
