@@ -385,3 +385,142 @@ pub extern "C" fn store_misaligned_handler(ctx: EntireContext) -> EntireResult {
     }
     ctx.restore()
 }
+
+/// SpacemiT K3 REGISTER_PRESERVATION access-fault emulation.
+///
+/// S-mode loads/stores to the REGISTER_PRESERVATION window are PMP-denied
+/// and raise Load/Store access faults; M-mode decodes the faulting
+/// instruction and emulates the access through the platform
+/// `emulate_load`/`emulate_store` hook
+/// ([`crate::platform::emulate_access_fault`], which dispatches to
+/// `spacemit_k3::emulate_load` / `emulate_store`; research doc §5.2 issue ①,
+/// mirroring OpenSBI `spacemit_k3_emulate_load/store`). Unsupported
+/// instructions and M-mode-only registers are re-injected into S-mode via
+/// [`delegate`].
+#[inline]
+pub extern "C" fn access_fault_handler(raw_ctx: EntireContext) -> EntireResult {
+    let mut ctx = raw_ctx.split().0;
+    let current_pc = mepc::read();
+    let current_addr = mtval::read();
+
+    let (current_inst, inst_len) = get_inst(current_pc);
+    debug!(
+        "REGISTER_PRESERVATION access fault: inst/{:x?}, addr {:x?} in {:x?}",
+        current_inst, current_addr, current_pc
+    );
+    let decode_result = decode(current_inst as u32);
+
+    use riscv::interrupt::machine::Exception;
+    use riscv::register::mcause::Trap;
+
+    let is_load = match riscv::register::mcause::read().cause() {
+        Trap::Exception(n) if n == Exception::LoadFault as usize => true,
+        Trap::Exception(n) if n == Exception::StoreFault as usize => false,
+        _ => {
+            delegate(&mut ctx);
+            return ctx.restore();
+        }
+    };
+
+    if is_load {
+        let inst_type = match decode_result {
+            Ok(Instruction::Lb(data)) => (data.rd(), VarType::Signed, 1),
+            Ok(Instruction::Lbu(data)) => (data.rd(), VarType::UnSigned, 1),
+            Ok(Instruction::Lh(data)) => (data.rd(), VarType::Signed, 2),
+            Ok(Instruction::Lhu(data)) => (data.rd(), VarType::UnSigned, 2),
+            Ok(Instruction::Lw(data)) => (data.rd(), VarType::Signed, 4),
+            Ok(Instruction::Lwu(data)) => (data.rd(), VarType::UnSigned, 4),
+            Ok(Instruction::Ld(data)) => (data.rd(), VarType::Signed, 8),
+            Ok(Instruction::Flw(data)) => (data.rd(), VarType::Float, 4),
+            _ => {
+                delegate(&mut ctx);
+                return ctx.restore();
+            }
+        };
+        let (target_reg, var_type, len) = inst_type;
+
+        let raw_data = match crate::platform::emulate_access_fault(true, current_addr, len, 0) {
+            crate::platform::AccessFaultResult::EmulatedLoad(v) => v,
+            _ => {
+                delegate(&mut ctx);
+                return ctx.restore();
+            }
+        };
+        let read_data = match var_type {
+            VarType::Signed => match len {
+                1 => raw_data as i8 as usize,
+                2 => raw_data as i16 as usize,
+                4 => raw_data as i32 as usize,
+                8 => raw_data as i64 as usize,
+                _ => {
+                    delegate(&mut ctx);
+                    return ctx.restore();
+                }
+            },
+            VarType::UnSigned => match len {
+                1 => raw_data as u8 as usize,
+                2 => raw_data as u16 as usize,
+                4 => raw_data as u32 as usize,
+                8 => raw_data as u64 as usize,
+                _ => {
+                    delegate(&mut ctx);
+                    return ctx.restore();
+                }
+            },
+            VarType::Float => match len {
+                4 => raw_data as u32 as usize,
+                8 => raw_data as u64 as usize,
+                _ => {
+                    delegate(&mut ctx);
+                    return ctx.restore();
+                }
+            },
+        };
+        match var_type {
+            VarType::Signed | VarType::UnSigned => {
+                save_reg_x(&mut ctx, target_reg as usize, read_data)
+            }
+            VarType::Float => set_reg_f(target_reg as usize, len, read_data),
+        };
+    } else {
+        let inst_type = match decode_result {
+            Ok(Instruction::Sb(data)) => (data.rs2(), VarType::UnSigned, 1),
+            Ok(Instruction::Sh(data)) => (data.rs2(), VarType::UnSigned, 2),
+            Ok(Instruction::Sw(data)) => (data.rs2(), VarType::UnSigned, 4),
+            Ok(Instruction::Sd(data)) => (data.rs2(), VarType::UnSigned, 8),
+            Ok(Instruction::Fsw(data)) => (data.rs2(), VarType::Float, 4),
+            _ => {
+                delegate(&mut ctx);
+                return ctx.restore();
+            }
+        };
+        let (target_reg, var_type, len) = inst_type;
+        let raw_data = match var_type {
+            VarType::Signed | VarType::UnSigned => get_reg_x(&mut ctx, target_reg as usize),
+            VarType::Float => get_reg_f(target_reg as usize, len),
+        };
+        let value = match var_type {
+            VarType::Signed | VarType::UnSigned => raw_data as u64,
+            VarType::Float => match len {
+                4 => raw_data as u32 as u64,
+                8 => raw_data as u64,
+                _ => {
+                    delegate(&mut ctx);
+                    return ctx.restore();
+                }
+            },
+        };
+        match crate::platform::emulate_access_fault(false, current_addr, len, value) {
+            crate::platform::AccessFaultResult::EmulatedStore => {}
+            _ => {
+                delegate(&mut ctx);
+                return ctx.restore();
+            }
+        }
+    }
+
+    unsafe {
+        mepc::write(current_pc + inst_len);
+    }
+    ctx.restore()
+}
