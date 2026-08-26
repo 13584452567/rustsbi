@@ -54,7 +54,7 @@ impl DomainRegion {
 /// if the entries would exceed the 16-entry PMP table.
 pub fn program_windows(
     first_slot: usize,
-    region_start: usize,
+    _region_start: usize,
     region_end: usize,
     windows: &[DomainRegion],
 ) -> Option<usize> {
@@ -63,16 +63,18 @@ pub fn program_windows(
         return None;
     }
     let mut slot = first_slot;
-    let mut cursor = region_start;
     for w in windows {
-        // Gap before the window: RWX.
-        write_entry(slot, Permission::RWX, false, cursor);
+        // Gap before the window: RWX. The TOR upper bound must be the window
+        // base (not the running cursor), otherwise the gap collapses to an
+        // empty range and the preceding NONE window would cover the entire
+        // low address space from 0 (K3: [0, REGISTER_PRESERVATION) would be
+        // denied for S-mode, faulting U-Boot's MMIO access on boot).
+        write_entry(slot, Permission::RWX, false, w.base);
         slot += 1;
         // Window itself: NONE (locked for ENF_PERMISSIONS).
         let locked = w.flags & ENF_PERMISSIONS != 0;
         write_entry(slot, Permission::NONE, locked, w.end());
         slot += 1;
-        cursor = w.end();
     }
     // Tail after the last window: RWX.
     write_entry(slot, Permission::RWX, false, region_end);

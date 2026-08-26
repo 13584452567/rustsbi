@@ -223,13 +223,19 @@ pub fn patch_device_tree(device_tree_ptr: usize) -> usize {
 
     let patched_length = serde_device_tree::ser::probe_dtb_length(&tree, &list).unwrap();
 
-    // We need aligned address here, so we use create u64 vec.
-    let patched_dtb_buffer = vec![0u64; patched_length.div_ceil(8)];
-    // Intentionally leak the buffer so that the patched DTB remains valid for the lifetime of the firmware.
-    // This is required because the returned pointer is used elsewhere and must not be deallocated.
-    let patched_dtb_buffer = patched_dtb_buffer.leak();
+    // We need aligned address here. Place the patched DTB in the writable
+    // memory right after the SBI image instead of in the heap: the heap
+    // lives inside the SBI image, which the PMP marks read-only for
+    // S-mode, and U-Boot writes/relocates the DTB during early boot
+    // (fdt fixup). A PMP store fault there hangs U-Boot silently — OpenSBI
+    // keeps its FDT in writable memory, which is why the official chain
+    // boots. On K3 the gap [sbi_end, RCPU0) is RWX in the PMP layout.
+    let dtb_buf_addr = (sbi_end + 0xfff) & !0xfff;
+    let patched_dtb_buffer: &'static mut [u64] = unsafe {
+        core::slice::from_raw_parts_mut(dtb_buf_addr as *mut u64, patched_length.div_ceil(8))
+    };
     let mut patched_dtb_buffer_u8: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(patched_dtb_buffer.as_ptr() as *mut u8, patched_length)
+        core::slice::from_raw_parts_mut(dtb_buf_addr as *mut u8, patched_length)
     };
     serde_device_tree::ser::to_dtb(&tree, &list, &mut patched_dtb_buffer_u8).unwrap();
 
