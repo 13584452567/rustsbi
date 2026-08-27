@@ -254,15 +254,40 @@ fn has_mstateen0() -> bool {
 pub fn configure_delegation_and_trap() {
     unsafe {
         // Delegate all interrupts and exceptions to supervisor mode.
-        asm!("csrw mideleg,    {}", in(reg) !0);
+        // Mirror OpenSBI sbi_hart.c mstatus_init(): enable FPU (FS) and
+        // vector (VS) context for the next (supervisor) stage.
+        let mstatus_s = riscv::register::mstatus::read().bits();
+        let mut mstatus_set = mstatus_s;
+        if riscv::register::misa::read().has_extension('F') || riscv::register::misa::read().has_extension('D') {
+            mstatus_set |= 0b11 << 13; // MSTATUS_FS = 0b11 (full/dirty)
+        }
+        if riscv::register::misa::read().has_extension('V') {
+            mstatus_set |= 0b11 << 9; // MSTATUS_VS = 0b11 (full/dirty)
+        }
+        if mstatus_set != mstatus_s {
+            asm!("csrw mstatus, {}", in(reg) mstatus_set);
+        }
+
+        asm!("csrw mideleg,    {}", in(reg) ((1usize << 1) | (1usize << 5) | (1usize << 9))); // SSIP|STIP|SEIP
         asm!("csrw medeleg,    {}", in(reg) !0);
         asm!("csrw mcounteren, {}", in(reg) !0);
-        asm!("csrw scounteren, {}", in(reg) !0);
+        asm!("csrw scounteren, {}", in(reg) 7usize); // CY|TM|IR (OpenSBI mstatus_init)
         // Keep supervisor environment calls and illegal instructions in M-mode.
         medeleg::clear_supervisor_env_call();
         medeleg::clear_load_misaligned();
         medeleg::clear_store_misaligned();
         medeleg::clear_illegal_instruction();
+        // Keep load/store access faults in M-mode on K3. The K3 REGISTER_
+        // PRESERVATION window (0xd4282000-0xd4283000, PMP NONE) is accessed
+        // by U-Boot's early DM probes (reset/clk/qspi/eth); M-mode must
+        // service those faults through access_fault_handler, mirroring
+        // OpenSBI (medeleg excludes load/store access fault bits). Without
+        // this, the faults are delegated to S-mode U-Boot before its gd is
+        // initialized and the board silently hangs.
+        if crate::platform::IS_K3_PLATFORM.load(Ordering::Acquire) {
+            medeleg::clear_load_fault();
+            medeleg::clear_store_fault();
+        }
 
         let hart_priv_version = hart_privileged_version(current_hartid());
         if hart_priv_version >= PrivilegedVersion::Version1_11 {
@@ -270,18 +295,84 @@ pub fn configure_delegation_and_trap() {
         }
         if hart_priv_version >= PrivilegedVersion::Version1_12 {
             // Configure environment features based on available extensions.
+            // PBMTE (menvcfg bit 62, Svpbmt) is mandatory: K3's DTB declares
+            // "svpbmt", so Linux marks dma-noncoherent device mappings (e.g.
+            // AMBA/primecell ioremap) with the PTE PBMT field (bit 62). If
+            // menvcfg.PBMTE is 0, the S-mode MMU rejects any PTE with a
+            // non-zero PBMT field and raises a load page fault — this is the
+            // "Unable to handle kernel paging request" Oops in
+            // amba_read_periphid during of_platform_default_populate_init.
+            // OpenSBI sets ENVCFG_PBMTE when SVPBMT is present (sbi_hart.c);
+            // mirror that here unconditionally (K3 implements Svpbmt).
             if hart_extension_probe(current_hartid(), Extension::Sstc) {
                 menvcfg::set_bits(
-                    menvcfg::STCE | menvcfg::CBIE_INVALIDATE | menvcfg::CBCFE | menvcfg::CBZE,
+                    menvcfg::STCE
+                        | menvcfg::PBMTE
+                        | menvcfg::CBIE_INVALIDATE
+                        | menvcfg::CBCFE
+                        | menvcfg::CBZE,
                 );
             } else {
-                menvcfg::set_bits(menvcfg::CBIE_INVALIDATE | menvcfg::CBCFE | menvcfg::CBZE);
+                menvcfg::set_bits(
+                    menvcfg::PBMTE
+                        | menvcfg::CBIE_INVALIDATE
+                        | menvcfg::CBCFE
+                        | menvcfg::CBZE,
+                );
             }
-            if is_aia_active()
-                && hart_extension_probe(current_hartid(), Extension::Smaia)
-                && has_mstateen0()
-            {
-                mstateen::enable_smode_aia();
+            // Mirror OpenSBI sbi_hart.c mstateen setup: unconditionally grant
+            // S/HS-mode access to state-enable CSRs (STATEN), context CSRs
+            // and henvcfg once mstateen0 exists. Linux 6.18 probes hstateen0
+            // (0x60c) early during sdtrig init; without mstateen0.STATEN set,
+            // that S-mode access raises illegal instruction and panics the
+            // kernel ("Oops - illegal instruction" in
+            // sdtrig_percpu_csrs_check). AIA-related bits are added when the
+            // IMSIC-backed AIA path is active (K3 implements Smaia).
+            let mstateen_present = has_mstateen0();
+            if mstateen_present {
+                let mut stateen0 =
+                    mstateen::STATEN | mstateen::CONTEXT | mstateen::HSENVCFG;
+                if is_aia_active()
+                    && hart_extension_probe(current_hartid(), Extension::Smaia)
+                {
+                    stateen0 |= mstateen::AIA | mstateen::IMSIC | mstateen::SVSLCT;
+                }
+                mstateen::set_stateen0(stateen0);
+                info!(
+                    "mstateen0: present, wrote 0x{:x}, readback 0x{:x}",
+                    stateen0,
+                    mstateen::read_stateen0()
+                );
+            } else {
+                warn!("mstateen0: CSR probe failed, NOT configured");
+            }
+            // Diagnostic: probe hstateen0 (0x60c) from M-mode. Linux sdtrig
+            // probes hstateen0 from S-mode and panics on illegal instruction
+            // even with mstateen0.STATEN set, so verify whether the CSR
+            // itself exists (M-mode read) and whether bit 57 (HSCONTEXT) is
+            // writable on K3.
+            let mut hstateen_info = TrapInfo::default();
+            let hstateen0_val = unsafe { csr_read_allow::<0x60c>(&mut hstateen_info) };
+            if hstateen_info.mcause == usize::MAX {
+                let mut hstateen_w = TrapInfo::default();
+                unsafe { csr_write_allow::<0x60c>(&mut hstateen_w, 1 << 57) };
+                let hstateen0_rb = if hstateen_w.mcause == usize::MAX {
+                    let mut hstateen_r = TrapInfo::default();
+                    unsafe { csr_read_allow::<0x60c>(&mut hstateen_r) }
+                } else {
+                    usize::MAX
+                };
+                info!(
+                    "hstateen0: present, read=0x{:x}, write-bit57-trap={}, readback=0x{:x}",
+                    hstateen0_val,
+                    hstateen_w.mcause != usize::MAX,
+                    hstateen0_rb
+                );
+            } else {
+                warn!(
+                    "hstateen0: M-mode probe trapped (mcause=0x{:x}), CSR likely absent",
+                    hstateen_info.mcause
+                );
             }
         }
         // Set up trap handling.

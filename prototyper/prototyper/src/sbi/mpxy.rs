@@ -7,17 +7,25 @@ use spin::Mutex;
 use rpmi::RpmiMailbox;
 use rpmi::message::{Error as RpmiError, servicegroup};
 
-/// RPMI channel attribute IDs (rpmi_msgprot.h
-/// `enum rpmi_channel_attribute_id`).
+/// SBI MPXY standard channel attribute IDs (sbi.h `enum sbi_mpxy_attribute_id`).
 mod channel_attr {
-    pub const PROTOCOL_VERSION: u32 = 0;
-    pub const MAX_DATA_LEN: u32 = 1;
-    pub const TX_TIMEOUT: u32 = 2;
-    pub const RX_TIMEOUT: u32 = 3;
-    pub const SERVICEGROUP_ID: u32 = 4;
-    pub const SERVICEGROUP_VERSION: u32 = 5;
-    pub const IMPL_ID: u32 = 6;
-    pub const IMPL_VERSION: u32 = 7;
+    pub const MSG_PROT_ID: u32 = 0;
+    pub const MSG_PROT_VERSION: u32 = 1;
+    pub const MSG_MAX_LEN: u32 = 2;
+    pub const MSG_SEND_TIMEOUT: u32 = 3;
+    pub const MSG_COMPLETION_TIMEOUT: u32 = 4;
+    pub const CAPABILITY: u32 = 5;
+    pub const SSE_EVENT_ID: u32 = 6;
+    pub const MSI_CONTROL: u32 = 7;
+    pub const MSI_ADDR_LO: u32 = 8;
+    pub const MSI_ADDR_HI: u32 = 9;
+    pub const MSI_DATA: u32 = 10;
+    pub const EVENTS_STATE_CONTROL: u32 = 11;
+    /// RPMI message-protocol attributes begin here (SBI_MPXY_ATTR_MSGPROTO_ATTR_START).
+    pub const RPMI_SERVICEGROUP_ID: u32 = 0x8000_0000;
+    pub const RPMI_SERVICEGROUP_VERSION: u32 = 0x8000_0001;
+    pub const RPMI_IMPL_ID: u32 = 0x8000_0002;
+    pub const RPMI_IMPL_VERSION: u32 = 0x8000_0003;
 }
 
 /// RPMI protocol version reported for every channel.
@@ -26,8 +34,16 @@ const RPMI_PROTOCOL_VERSION: u32 = 0x0001_0000; // v1.0
 const RPMI_IMPL_ID: u32 = 0x0;
 /// RPMI implementation version reported for every channel.
 const RPMI_IMPL_VERSION: u32 = 0x1;
-/// Maximum message data length per channel.
-const RPMI_MAX_DATA_LEN: u32 = 56;
+/// Maximum message data length per channel. The K3 mailbox uses a
+/// slot size of 256 bytes, so the payload limit is `slot_size - 8`
+/// (`RPMI_MSG_DATA_SIZE(256)`), matching OpenSBI.
+const RPMI_MAX_DATA_LEN: u32 = 248;
+/// RPMI message protocol ID reported as MSG_PROT_ID (sbi.h SBI_MPXY_MSGPROTO_RPMI_ID).
+const RPMI_MSGPROTO_ID: u32 = 0x0;
+/// Channel capability bitmask (sbi.h `SBI_MPXY_CHAN_CAP_*`): send-with/without
+/// response plus notification events-state; MSI is not advertised so the
+/// mailbox controller skips the MSI setup path.
+const CHANNEL_CAPABILITY: u32 = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 2); // SEND_WITH_RESP|SEND_WITHOUT_RESP|GET_NOTIFICATIONS|EVENTS_STATE
 
 /// The RPMI service groups exposed as MPXY channels. The channel ID is the
 /// RPMI service group ID.
@@ -40,6 +56,8 @@ const CHANNELS: &[u16] = &[
     servicegroup::VOLTAGE,
     servicegroup::CLOCK,
     servicegroup::DOMAIN,
+    servicegroup::RTC,
+    servicegroup::PWRKEY,
 ];
 
 /// Convert an RPMI error to an SBI return value (mirrors OpenSBI
@@ -77,7 +95,13 @@ fn rpmi_error_to_sbi(err: RpmiError) -> SbiRet {
 /// platform provides one, requests are reported as not supported.
 pub(crate) struct SbiMpxy {
     mailbox: Mutex<Option<&'static RpmiMailbox>>,
-    shmem: AtomicUsize,
+    // MPXY shared memory is per-hart: Linux's riscv-sbi-mpxy-mbox driver
+    // allocates a separate shmem page for every CPU and calls SET_SHMEM on
+    // each (mpxy_setup_shmem). OpenSBI tracks this per-hart
+    // (hart_mpxy_state_get); a single shared field would end up pointing at
+    // the last CPU's page while the current hart reads its own, so the S-mode
+    // side sees zeros and reports "no MPXY channels available".
+    shmem: [AtomicUsize; crate::cfg::NUM_HART_MAX],
 }
 
 impl SbiMpxy {
@@ -85,7 +109,7 @@ impl SbiMpxy {
     pub(crate) const fn new() -> Self {
         Self {
             mailbox: Mutex::new(None),
-            shmem: AtomicUsize::new(0),
+            shmem: [const { AtomicUsize::new(0) }; crate::cfg::NUM_HART_MAX],
         }
     }
 
@@ -99,6 +123,12 @@ impl SbiMpxy {
         *self.mailbox.lock()
     }
 
+    /// Returns the current hart's MPXY shared-memory address.
+    #[inline]
+    fn shmem_hart(&self) -> &AtomicUsize {
+        &self.shmem[crate::riscv::current_hartid()]
+    }
+
     /// Returns whether the given channel ID is exposed.
     fn is_channel(&self, channel_id: u32) -> bool {
         CHANNELS.iter().any(|&id| id as u32 == channel_id)
@@ -109,14 +139,24 @@ impl SbiMpxy {
         for i in 0..count {
             let attr = base + i;
             let value = match attr {
-                channel_attr::PROTOCOL_VERSION => RPMI_PROTOCOL_VERSION,
-                channel_attr::MAX_DATA_LEN => RPMI_MAX_DATA_LEN,
-                channel_attr::TX_TIMEOUT => rpmi::mailbox::RPMI_DEF_TX_TIMEOUT,
-                channel_attr::RX_TIMEOUT => rpmi::mailbox::RPMI_DEF_RX_TIMEOUT,
-                channel_attr::SERVICEGROUP_ID => channel_id,
-                channel_attr::SERVICEGROUP_VERSION => 0x0001_0000, // v1.0
-                channel_attr::IMPL_ID => RPMI_IMPL_ID,
-                channel_attr::IMPL_VERSION => RPMI_IMPL_VERSION,
+                // Standard SBI MPXY channel attributes
+                channel_attr::MSG_PROT_ID => RPMI_MSGPROTO_ID,
+                channel_attr::MSG_PROT_VERSION => RPMI_PROTOCOL_VERSION,
+                channel_attr::MSG_MAX_LEN => RPMI_MAX_DATA_LEN,
+                channel_attr::MSG_SEND_TIMEOUT => rpmi::mailbox::RPMI_DEF_TX_TIMEOUT,
+                channel_attr::MSG_COMPLETION_TIMEOUT => rpmi::mailbox::RPMI_DEF_RX_TIMEOUT,
+                channel_attr::CAPABILITY => CHANNEL_CAPABILITY,
+                channel_attr::SSE_EVENT_ID => 0,
+                channel_attr::MSI_CONTROL => 0,
+                channel_attr::MSI_ADDR_LO => 0,
+                channel_attr::MSI_ADDR_HI => 0,
+                channel_attr::MSI_DATA => 0,
+                channel_attr::EVENTS_STATE_CONTROL => 0,
+                // RPMI message-protocol attributes (channel ID == service group ID)
+                channel_attr::RPMI_SERVICEGROUP_ID => channel_id,
+                channel_attr::RPMI_SERVICEGROUP_VERSION => 0x0001_0000,
+                channel_attr::RPMI_IMPL_ID => RPMI_IMPL_ID,
+                channel_attr::RPMI_IMPL_VERSION => RPMI_IMPL_VERSION,
                 _ => return false,
             };
             let off = (i * 4) as usize;
@@ -144,36 +184,46 @@ impl rustsbi::Mpxy for SbiMpxy {
         let all_ones = shmem.phys_addr_lo() == usize::MAX && shmem.phys_addr_hi() == usize::MAX;
         if all_ones {
             // Disable shared memory.
-            self.shmem.store(0, Ordering::Release);
+            self.shmem_hart().store(0, Ordering::Release);
             return SbiRet::success(0);
         }
         if shmem.phys_addr_lo() & 0xfff != 0 {
             return SbiRet::invalid_param();
         }
-        self.shmem.store(shmem.phys_addr_lo(), Ordering::Release);
+        self.shmem_hart().store(shmem.phys_addr_lo(), Ordering::Release);
         SbiRet::success(0)
     }
 
     fn get_channel_ids(&self, start_index: u32) -> SbiRet {
-        let shmem = self.shmem.load(Ordering::Acquire);
+        let shmem = self.shmem_hart().load(Ordering::Acquire);
         if shmem == 0 {
             return SbiRet::no_shmem();
         }
-        let start = start_index as usize;
-        if start >= CHANNELS.len() {
+        // Mirror OpenSBI sbi_mpxy.c sbi_mpxy_get_channel_ids():
+        //  - start_index > count => invalid_param (start_index == count is
+        //    valid and returns zero remaining/returned).
+        //  - REMAINING (shmem[0]) is the number of channel IDs left AFTER the
+        //    returned set; RETURNED (shmem[1]) is how many were written.
+        //  - channel IDs follow at shmem[2..].
+        let count = CHANNELS.len() as u32;
+        if start_index > count {
             return SbiRet::invalid_param();
         }
-        // Layout: REMAINING at 0x0, RETURNED at 0x4, IDs from 0x8.
-        let remaining = (CHANNELS.len() - start) as u32;
-        let returned = remaining.min(1);
+        // Number of channel IDs that fit after the remaining/returned fields.
+        let max_channelids = (self.get_shmem_size() / 4) - 2;
+        let remaining_before = count - start_index;
+        let returned = remaining_before.min(max_channelids as u32);
+        let remaining_after = count - (start_index + returned);
         // Safety: the shared memory is S-mode owned and writable.
         let base = shmem as *mut u8;
         unsafe {
-            base.add(0).cast::<u32>().write_volatile(remaining);
+            base.add(0).cast::<u32>().write_volatile(remaining_after);
             base.add(4).cast::<u32>().write_volatile(returned);
-            base.add(8)
-                .cast::<u32>()
-                .write_volatile(CHANNELS[start] as u32);
+            for i in 0..returned {
+                base.add(8 + i as usize * 4)
+                    .cast::<u32>()
+                    .write_volatile(CHANNELS[(start_index + i) as usize] as u32);
+            }
         }
         SbiRet::success(0)
     }
@@ -183,7 +233,7 @@ impl rustsbi::Mpxy for SbiMpxy {
         channel_id: u32,
         base_attribute_id: u32,
         attribute_count: u32,
-        output: SharedPtr<u8>,
+        _output: SharedPtr<u8>,
     ) -> SbiRet {
         if !self.is_channel(channel_id) {
             return SbiRet::not_supported();
@@ -191,14 +241,28 @@ impl rustsbi::Mpxy for SbiMpxy {
         if attribute_count == 0 {
             return SbiRet::invalid_param();
         }
+        // SBI MPXY READ_ATTRIBUTES writes the attribute values into the
+        // shared memory established by SET_SHMEM (see OpenSBI
+        // sbi_mpxy_read_attributes, which targets `hart_shmem_base(ms)`); the
+        // `output` register argument is not used by the SBI ABI.
+        let shmem = self.shmem_hart().load(Ordering::Acquire);
+        if shmem == 0 {
+            return SbiRet::no_shmem();
+        }
+        // Safety: the shared memory is S-mode owned and writable.
         let out = unsafe {
-            core::slice::from_raw_parts_mut(
-                output.phys_addr_lo() as *mut u8,
-                (attribute_count as usize) * 4,
-            )
+            core::slice::from_raw_parts_mut(shmem as *mut u8, (attribute_count as usize) * 4)
         };
         if !self.read_channel_attrs(channel_id, base_attribute_id, attribute_count, out) {
             return SbiRet::bad_range();
+        }
+        if base_attribute_id == 0 && attribute_count >= 2 {
+            let v0 = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+            let v1 = u32::from_le_bytes([out[4], out[5], out[6], out[7]]);
+            info!(
+                "MPXY read_attrs DIAG: chan={} shmem=0x{:x} attr0={} attr1(proto_ver)={:#x}",
+                channel_id, shmem, v0, v1
+            );
         }
         SbiRet::success(0)
     }
@@ -206,14 +270,25 @@ impl rustsbi::Mpxy for SbiMpxy {
     fn write_attributes(
         &self,
         channel_id: u32,
-        _base_attribute_id: u32,
-        _attribute_count: u32,
+        base_attribute_id: u32,
+        attribute_count: u32,
         _input: SharedPtr<u8>,
     ) -> SbiRet {
         if !self.is_channel(channel_id) {
             return SbiRet::not_supported();
         }
-        // All RPMI channel attributes are read-only.
+        if attribute_count == 0 {
+            return SbiRet::invalid_param();
+        }
+        // Allow toggling the events-state control and MSI control (RustSBI
+        // manages the notification buffer internally; MSI is unused but the
+        // driver may still write it). All other channel attributes are
+        // read-only.
+        if base_attribute_id == channel_attr::EVENTS_STATE_CONTROL
+            || base_attribute_id == channel_attr::MSI_CONTROL
+        {
+            return SbiRet::success(0);
+        }
         SbiRet::denied()
     }
 
@@ -229,7 +304,7 @@ impl rustsbi::Mpxy for SbiMpxy {
         if message_data_len > RPMI_MAX_DATA_LEN as usize {
             return SbiRet::invalid_param();
         }
-        let shmem = self.shmem.load(Ordering::Acquire);
+        let shmem = self.shmem_hart().load(Ordering::Acquire);
         if shmem == 0 {
             return SbiRet::no_shmem();
         }
@@ -243,15 +318,36 @@ impl rustsbi::Mpxy for SbiMpxy {
         let req = unsafe { core::slice::from_raw_parts(shmem as *const u8, message_data_len) };
         let mut resp = [0u8; RPMI_MAX_DATA_LEN as usize];
         match mbox.normal_request_with_status(channel_id as u16, service_id, req, &mut resp) {
-            Ok(RpmiError::Success) => {
-                // Write the response back at offset 0x0; return its length.
+            Ok((RpmiError::Success, len)) => {
+                info!(
+                    "MPXY send DIAG: chan={} svc={} len={} resp0={} resp1={}",
+                    channel_id,
+                    service_id,
+                    len,
+                    u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]),
+                    u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]])
+                );
+                // Write the full [status][data] response back at offset 0x0;
+                // return the actual response length.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(resp.as_ptr(), shmem as *mut u8, resp.len());
+                    core::ptr::copy_nonoverlapping(resp.as_ptr(), shmem as *mut u8, len);
                 }
-                SbiRet::success(resp.len())
+                SbiRet::success(len)
             }
-            Ok(err) => rpmi_error_to_sbi(err),
-            Err(()) => SbiRet::timeout(),
+            Ok((err, _)) => {
+                warn!(
+                    "MPXY send DIAG: chan={} svc={} ERR={:?}",
+                    channel_id, service_id, err
+                );
+                rpmi_error_to_sbi(err)
+            }
+            Err(()) => {
+                warn!(
+                    "MPXY send DIAG: chan={} svc={} TIMEOUT (no ack)",
+                    channel_id, service_id
+                );
+                SbiRet::timeout()
+            }
         }
     }
 
@@ -267,7 +363,7 @@ impl rustsbi::Mpxy for SbiMpxy {
         if message_data_len > RPMI_MAX_DATA_LEN as usize {
             return SbiRet::invalid_param();
         }
-        let shmem = self.shmem.load(Ordering::Acquire);
+        let shmem = self.shmem_hart().load(Ordering::Acquire);
         if shmem == 0 {
             return SbiRet::no_shmem();
         }
@@ -287,7 +383,7 @@ impl rustsbi::Mpxy for SbiMpxy {
         if !self.is_channel(channel_id) {
             return SbiRet::not_supported();
         }
-        let shmem = self.shmem.load(Ordering::Acquire);
+        let shmem = self.shmem_hart().load(Ordering::Acquire);
         if shmem == 0 {
             return SbiRet::no_shmem();
         }

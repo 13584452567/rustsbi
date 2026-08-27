@@ -286,7 +286,18 @@ impl ConsoleDevice for UartXscaleWrap {
         // SAFETY: same justification as `read`: volatile MMIO access under the
         // published console device's mutex.
         let uart = unsafe { &mut *self.inner.get() };
+        // Translate a bare LF (`\n`) into CRLF (`\r\n`) so that the terminal
+        // returns to column 0 before advancing to the next line. Linux's
+        // `earlycon=sbi` (SBI DBCN path) emits a raw `\n` per line; without
+        // the `\r`, the next line starts mid-row, producing the interleaved
+        // timestamp/message columns seen in early kernel logs. This mirrors
+        // OpenSBI's `nputs()` (lib/sbi/sbi_console.c) which emits `\r` before
+        // every `\n`. RustSBI's own logger already prints `\n\r`, so the extra
+        // `\r` is harmless there.
         for &c in buf {
+            if c == b'\n' {
+                uart.putchar(b'\r');
+            }
             uart.putchar(c);
         }
         buf.len()

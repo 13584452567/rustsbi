@@ -8,6 +8,8 @@
 
 use core::sync::atomic::{AtomicU16, Ordering};
 
+use log::{info, warn};
+
 use crate::message::{Error, MessageHeader, MessageType, RPMI_MSG_TOKEN_MASK};
 use crate::smq::{Le32, SmqQueue};
 
@@ -95,7 +97,7 @@ impl RpmiMailbox {
         service_id: u8,
         req: &[u8],
         resp: &mut [u8],
-    ) -> Result<Error, ()> {
+    ) -> Result<(Error, usize), ()> {
         if resp.len() < 4 {
             return Err(());
         }
@@ -113,6 +115,10 @@ impl RpmiMailbox {
                 .send(&header, req, self.doorbell)
                 .map_err(|_| ())?;
         }
+        info!(
+            "RPMI send: sg={} svc={} token={} len={} db={:?}",
+            servicegroup_id, service_id, token, req.len(), self.doorbell_addr()
+        );
 
         // Wait for the acknowledgement carrying our token.
         let mut rx = [0u8; 256];
@@ -121,15 +127,27 @@ impl RpmiMailbox {
             let n = unsafe { self.queues[queue_idx::P2A_ACK].receive(token, &mut rx) };
             if let Ok(n) = n {
                 let status = i32::from_le_bytes([rx[0], rx[1], rx[2], rx[3]]);
-                let copy = n.saturating_sub(4).min(resp.len());
+                info!(
+                    "RPMI recv: sg={} svc={} token={} n={} status={:#x}",
+                    servicegroup_id, service_id, token, n, status as u32
+                );
+                // `rx` is the full acknowledgement payload
+                // [status(4)][response data]. Copy it wholesale so the caller
+                // sees the same layout OpenSBI's rpmi_normal_request_with_status
+                // produces (status at offset 0, data from offset 4).
+                let copy = n.min(resp.len());
                 if copy > 0 {
-                    resp[..copy].copy_from_slice(&rx[4..4 + copy]);
+                    resp[..copy].copy_from_slice(&rx[..copy]);
                 }
-                return Ok(Error::from_status(status));
+                return Ok((Error::from_status(status), copy));
             }
             // No message yet: yield and retry.
             core::hint::spin_loop();
         }
+        warn!(
+            "RPMI send TIMEOUT: sg={} svc={} token={} (no ack in {} iters)",
+            servicegroup_id, service_id, token, RPMI_DEF_RX_TIMEOUT
+        );
         Err(())
     }
 
@@ -152,11 +170,16 @@ impl RpmiMailbox {
             token,
         );
         // Safety: the queue aliases shared memory established at `new`.
-        unsafe {
+        let r = unsafe {
             self.queues[queue_idx::A2P_REQ]
                 .send(&header, req, self.doorbell)
                 .map_err(|_| ())
-        }
+        };
+        info!(
+            "RPMI posted: sg={} svc={} token={} len={} ok={}",
+            servicegroup_id, service_id, token, req.len(), r.is_ok()
+        );
+        r
     }
 
     /// Receive an asynchronous notification from the platform management
@@ -187,5 +210,12 @@ impl RpmiMailbox {
     /// Returns the slot size of this mailbox.
     pub const fn slot_size(&self) -> usize {
         self.slot_size
+    }
+
+    /// Debug helper: the doorbell register address (or 0).
+    pub fn doorbell_addr(&self) -> usize {
+        self.doorbell
+            .map(|db| db as *const _ as usize)
+            .unwrap_or(0)
     }
 }

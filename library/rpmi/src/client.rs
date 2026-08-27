@@ -22,9 +22,10 @@ impl<'a> BaseClient<'a> {
     /// Send a Base service request that takes one u32 input and returns
     /// two u32 output words (mirrors `smq_base_get_two_u32`).
     fn get_two_u32(&mut self, service_id: u8, inarg: u32) -> Result<[u32; 2], Error> {
-        let mut resp = [0u8; 8];
+        // Response is [status(4)][data word1(4)][data word2(4)].
+        let mut resp = [0u8; 12];
         let req = inarg.to_le_bytes();
-        let err = self
+        let (err, _len) = self
             .mailbox
             .normal_request_with_status(servicegroup::BASE, service_id, &req, &mut resp)
             .map_err(|_| Error::Timeout)?;
@@ -32,8 +33,8 @@ impl<'a> BaseClient<'a> {
             return Err(err);
         }
         Ok([
-            u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]),
             u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]),
+            u32::from_le_bytes([resp[8], resp[9], resp[10], resp[11]]),
         ])
     }
 
@@ -63,7 +64,7 @@ impl<'a> BaseClient<'a> {
     /// portion actually filled.
     pub fn get_platform_info<'b>(&mut self, buf: &'b mut [u8]) -> Result<&'b [u8], Error> {
         let mut resp = [0u8; 256];
-        let err = self
+        let (err, _len) = self
             .mailbox
             .normal_request_with_status(
                 servicegroup::BASE,
@@ -87,7 +88,7 @@ impl<'a> BaseClient<'a> {
     pub fn enable_notification(&mut self, event_id: u32) -> Result<(), Error> {
         let mut resp = [0u8; 4];
         let req = event_id.to_le_bytes();
-        let err = self
+        let (err, _len) = self
             .mailbox
             .normal_request_with_status(
                 servicegroup::BASE,

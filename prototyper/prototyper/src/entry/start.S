@@ -4,11 +4,22 @@
 //
 // The 6:/7: signal words are read before BSS is cleared, so they must live
 // in .text.entry (loaded content), not in BSS.
+//
+// LINK ORDER MATTERS: the cold boot path must occupy the head of the image
+// because the FIT entry point equals the image base (0x100000000). The K3
+// warm-boot entry `_start_warm_k3` is placed AFTER the cold path below, so a
+// PMU-woken secondary hart lands on the warm sequence while the boot hart
+// always starts at the cold ceremony.
 
 .option arch, +a
 
 // 1. Mask all interrupts.
 csrw    mie, zero
+
+// Flush TLB and I-cache so a PMU-woken (warm) hart executes coherent
+// code after power-up (mirrors OpenSBI reset-vector flush).
+        sfence.vma
+        fence.i
 
 // 2. Elect a single boot hart: the first hart to arrive wins the race
 // (amoadd returns the previous value; nonzero means another hart won).
@@ -52,3 +63,63 @@ csrw    mie, zero
   .word    0
 7: // bss ready signal word.
   .word    0
+
+// K3 warm-boot entry: a secondary hart PHY-woken by an SBI HSM `hart_start`
+// (PMU `PMU_CAP_COREx_WAKEUP`) fetches its cluster RVBADDR, which the boot
+// hart points here. Mirrors OpenSBI fw_base.S `_start_warm` under
+// CONFIG_PLATFORM_SPACEMIT_K3: PMACFG0 audio-buffer/XIP attributes, core
+// snoop, MSETUP cache enable (AMOs depend on dcache on this SoC) and the
+// H-extension for X100 harts (hartid < 8). BSS is already cleared and the
+// boot-hart race is long over, so skip straight to the stack/main path.
+    .balign  4
+    .globl _start_warm_k3
+_start_warm_k3:
+    // Disable all interrupts.
+    csrw    mie, zero
+
+    // set audio buffer to cacheable
+    li      t0, 0xff
+    slli    t0, t0, 48
+    csrc    0x7de, t0
+    li      t0, 0x20
+    slli    t0, t0, 48
+    csrs    0x7de, t0
+    sfence.vma
+
+    // set XIP address to IO attribute
+    lui     t0, 0xff0
+    csrc    0x7de, t0
+    lui     t0, 0x220
+    csrs    0x7de, t0
+    sfence.vma
+
+    // enable core snoop for this hart
+    csrw    0x7f0, zero
+    csrr    t0, mhartid
+    andi    t1, t0, 3
+    li      a5, 1
+    sllw    a5, a5, t1
+    csrs    0x7f0, a5
+
+    // enable d/i cache; some instructions like amo depend on dcache
+    li      a5, 0x10073
+    csrs    0x7c0, a5
+    fence   iorw, iorw
+
+    // enable hypervisor extension for X100 (hartid < 8); A100 skips it
+    csrr    t0, mhartid
+    li      t1, 8
+    bgeu    t0, t1, 20f
+    csrr    t2, misa
+    li      t3, 1
+    slli    t3, t3, 7      // 'H' - 'A'
+    or      t2, t2, t3
+    csrw    misa, t2
+20:
+    // A PMU-woken hart carries garbage in a0-a2; the secondary path decodes
+    // a1/a2 into BootInfo, so hand it a clean (secondary) envelope. Join the
+    // shared cold path at `5:` (locate_stack + main) — backward ref since
+    // the warm entry now sits after the cold path.
+    li      a1, 0
+    li      a2, 0
+    j       5b

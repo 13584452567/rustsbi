@@ -401,7 +401,7 @@ pub(crate) fn wakeup_core(hartid: usize) {
 /// The boot hart points `C2_RVBADDR` at this function and asserts
 /// `PMU_CAP_CORE8_WAKEUP`, waking core8 which then performs the vector-load
 /// tuning, votes its cluster/core down, disables caches and snoop, and hangs
-/// in a `wfi` loop — mirroring OpenSBI's `boot_entry_dummy()`.
+/// in a `wfi` loop -?mirroring OpenSBI's `boot_entry_dummy()`.
 ///
 /// This function never returns.
 fn boot_entry_dummy() -> ! {
@@ -420,9 +420,9 @@ fn boot_entry_dummy() -> ! {
 
         // Re-set the boot entry of cluster2 to the normal warm entry
         // (spacemit_k3.c L67-69): a later HSM start of an A100 core would
-        // otherwise land back on this dummy. The warm entry is the SBI
-        // link start, as used for the X100 clusters.
-        (*C2_RVBADDR).set(crate::cfg::SBI_LINK_START_ADDRESS as u64);
+        // otherwise land back on this dummy. The warm entry is the same
+        // `_start_warm_k3` used for the X100 clusters.
+        (*C2_RVBADDR).set(warm_entry());
 
         // Vote core8 power-down (spacemit_k3.c L71)
         vote_powrdown_core(8);
@@ -502,11 +502,11 @@ unsafe fn k3_pre_init(warmboot_addr: u64) {
             3 => (C3_RVBADDR, PMU_C3_L2_FLUSH_CTRL),
             _ => unreachable!(),
         };
-        let entry = if cluster >= 2 {
-            boot_entry_dummy as *const () as usize as u64
-        } else {
-            warmboot_addr
-        };
+        // Every cluster (X100 and A100) gets the warm entry, matching OpenSBI
+        // which sets `scratch->warmboot_addr` for all 16 harts; all A100
+        // harts therefore come online through HSM hart_start like the X100
+        // harts instead of being parked.
+        let entry = warmboot_addr;
         unsafe {
             (*rvbaddr).set(entry);
             // Hardware L2 cache flush (k3.h PMU_L2_FLUSH_HW_EN | HW_TYPE)
@@ -522,12 +522,16 @@ unsafe fn k3_pre_init(warmboot_addr: u64) {
         unsafe { cci_enable_snoop_dvm_reqs(slave_if_id) };
     }
 
-    // Devote (un-vote) every cluster so it stays powered (spacemit_k3.c
-    // L163-164), then wake core8 — the first A100 core of cluster2 — into
-    // the parking entry (spacemit_k3.c L164-166). C2/C3 RVBADDR already
-    // point at the parking entry from the loop above.
+    // Devote (un-vote) every hart's cluster so it stays powered (spacemit_k3.c
+    // iterates all platform harts), then wake core8 -?the first A100 core of
+    // cluster2 -?into the parking entry (spacemit_k3.c L164-166). The dummy
+    // entry re-points C2 RVBADDR at the warm entry before parking core8, so
+    // later HSM starts of harts 8-11 land on the warm entry.
     for hartid in 0..PLATFORM_MAX_CPUS {
         devote_pwrdown_cluster(hartid);
+    }
+    unsafe {
+        (*C2_RVBADDR).set(boot_entry_dummy as *const () as usize as u64);
     }
     wakeup_core(8);
 
@@ -566,7 +570,7 @@ pub unsafe fn early_init(cold_boot: bool, warmboot_addr: u64) {
 /// On the K3, only hart 0 is allowed to cold boot; all other harts must use
 /// the warmboot path. This function also enables core snoop, instruction
 /// prefetch and TLB prefetch for the calling hart, applies the A100
-/// vector-load tuning for `hartid ≥ 8`, and turns on the RV-Trace top clock
+/// vector-load tuning for `hartid -?8`, and turns on the RV-Trace top clock
 /// (spacemit_k3.c `spacemit_k3_cold_boot_allowed`, L217-246).
 ///
 /// Returns `true` if the hart is allowed to cold boot.
@@ -594,6 +598,20 @@ pub fn cold_boot_allowed(hart_id: usize) -> bool {
     hart_id == 0
 }
 
+// The K3 warm-boot entry defined in start.S (`_start_warm_k3`).
+unsafe extern "C" {
+    #[link_name = "_start_warm_k3"]
+    static START_WARM_K3: u8;
+}
+
+/// Address of the K3 warm-boot entry (`_start_warm_k3` in start.S).
+///
+/// PMU-woken secondary harts fetch their cluster RVBADDR, which the boot
+/// hart points at this entry (mirrors OpenSBI `scratch->warmboot_addr` =
+/// `_start_warm`).
+pub fn warm_entry() -> u64 {
+    unsafe { core::ptr::addr_of!(START_WARM_K3) as u64 }
+}
 /// Get the maximum number of CPUs supported by this platform.
 #[inline]
 pub const fn max_cpus() -> usize {
@@ -729,7 +747,7 @@ pub fn s_addr_to_pa(addr: usize) -> Option<usize> {
 }
 
 /// M-mode-only registers within REGISTER_PRESERVATION that must NOT be
-/// emulated for S-mode — return `None` so the fault is redirected back to
+/// emulated for S-mode -?return `None` so the fault is redirected back to
 /// S-mode as a real access error (spacemit_k3.c `m_only_ranges[]`, L304-326).
 struct AddrRange {
     base: usize,
@@ -852,7 +870,7 @@ const MIP_ALL: usize = (1 << 1) | (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1
 /// IMSIC interrupt state saved across suspend (k3.h `struct imsic_config`,
 /// L162-186). The M- and S-mode levels are saved for every hart; the H/VS
 /// levels only for X100 harts (`hartid < 8`), which implement the hypervisor
-/// extension — the A100 cores do not (official paper §4.1).
+/// extension -?the A100 cores do not (official paper §4.1).
 #[derive(Clone, Copy, Default)]
 pub struct ImsicConfig {
     /* m-mode */
@@ -1172,7 +1190,7 @@ fn unmask_irq(hartid: usize) {
 /// Suspend preparation for the current hart (`__rpmi_hsm_suspend_pre`,
 /// k3_corepm.c L621-683): mask fast interrupts, then verify no M/S/VS
 /// interrupt is pending via the IMSIC TOPEI registers. The check must pass
-/// five consecutive clean rounds — any pending interrupt aborts immediately
+/// five consecutive clean rounds -?any pending interrupt aborts immediately
 /// and restores the masks; otherwise the core and cluster 3 APCR votes are
 /// placed.
 ///
@@ -1195,7 +1213,7 @@ pub fn suspend_pre(hartid: usize) -> bool {
             unmask_irq(hartid);
             return false;
         }
-        // 3. query h-mode irq pending (CSR_HGEIP, 0xe12) — X100 only
+        // 3. query h-mode irq pending (CSR_HGEIP, 0xe12) -?X100 only
         if hartid < 8 && unsafe { csr_read_raw::<0xe12>() } != 0 {
             unmask_irq(hartid);
             return false;

@@ -72,11 +72,11 @@ impl rustsbi::Cppc for SbiCppc {
             as_bytes(&req),
             &mut resp,
         ) {
-            Ok(RpmiError::Success) => {
+            Ok((RpmiError::Success, _)) => {
                 let reg_len = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
                 SbiRet::success(reg_len as usize)
             }
-            Ok(err) => rpmi_error_to_sbi(err),
+            Ok((err, _)) => rpmi_error_to_sbi(err),
             Err(()) => SbiRet::timeout(),
         }
     }
@@ -97,11 +97,11 @@ impl rustsbi::Cppc for SbiCppc {
             as_bytes(&req),
             &mut resp,
         ) {
-            Ok(RpmiError::Success) => {
+            Ok((RpmiError::Success, _)) => {
                 let lo = u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]]);
                 SbiRet::success(lo as usize)
             }
-            Ok(err) => rpmi_error_to_sbi(err),
+            Ok((err, _)) => rpmi_error_to_sbi(err),
             Err(()) => SbiRet::timeout(),
         }
     }
@@ -122,11 +122,11 @@ impl rustsbi::Cppc for SbiCppc {
             as_bytes(&req),
             &mut resp,
         ) {
-            Ok(RpmiError::Success) => {
+            Ok((RpmiError::Success, _)) => {
                 let hi = u32::from_le_bytes([resp[8], resp[9], resp[10], resp[11]]);
                 SbiRet::success(hi as usize)
             }
-            Ok(err) => rpmi_error_to_sbi(err),
+            Ok((err, _)) => rpmi_error_to_sbi(err),
             Err(()) => SbiRet::timeout(),
         }
     }
@@ -149,8 +149,8 @@ impl rustsbi::Cppc for SbiCppc {
             as_bytes(&req),
             &mut resp,
         ) {
-            Ok(RpmiError::Success) => SbiRet::success(0),
-            Ok(err) => rpmi_error_to_sbi(err),
+            Ok((RpmiError::Success, _)) => SbiRet::success(0),
+            Ok((err, _)) => rpmi_error_to_sbi(err),
             Err(()) => SbiRet::timeout(),
         }
     }

@@ -3,7 +3,7 @@ use riscv::register::{mepc, mie, mstatus, mtval, satp, sstatus};
 use riscv_decode::{Instruction, decode};
 use sbi_spec::pmu::firmware_event;
 
-use crate::riscv::csr::{CSR_TIME, CSR_TIMEH};
+use crate::riscv::csr::{CSR_HSTATEEN0, CSR_TIME, CSR_TIMEH};
 use crate::riscv::current_hartid;
 use crate::sbi::console;
 use crate::sbi::features::{Extension, hart_extension_probe};
@@ -42,6 +42,14 @@ pub fn switch(mut ctx: FastContext, start_addr: usize, opaque: usize) -> FastRes
     ctx.regs().a[0] = current_hartid();
     ctx.regs().a[1] = opaque;
     ctx.regs().pc = start_addr;
+    // Mirror OpenSBI sbi_hart_switch_mode(): program TCMCFG (0x5db) and
+    // MHCR (0x7c1) bit0 before mret into the next stage on the SpacemiT K3.
+    unsafe {
+        core::arch::asm!("csrw 0x5db, {}", in(reg) 1usize);
+        let mhcr: usize;
+        core::arch::asm!("csrr {}, 0x7c1", out(reg) mhcr);
+        core::arch::asm!("csrw 0x7c1, {}", in(reg) mhcr | 1);
+    }
     ctx.call(2)
 }
 
@@ -247,6 +255,17 @@ pub extern "C" fn illegal_instruction_handler(raw_ctx: EntireContext) -> EntireR
                     csr.rd() as usize,
                     crate::sbi::ipi().unwrap().get_timeh(),
                 );
+            }
+            CSR_HSTATEEN0 => {
+                // K3 implements neither hstateen0 (0x60c) nor the H
+                // extension state-enable CSRs, although the DTB declares
+                // 'h' + smstateen. Linux 6.18 sdtrig probes hstateen0 from
+                // S-mode without exception-table protection; an illegal
+                // instruction there panics the kernel. Emulate the CSR as
+                // read-only-zero so the probe reads back 0, making Linux
+                // fall through to its `sdtrig_csrs_disable_all` graceful
+                // degradation path instead of panicking.
+                save_reg_x(&mut ctx, csr.rd() as usize, 0);
             }
             _ => {
                 delegate(&mut ctx);

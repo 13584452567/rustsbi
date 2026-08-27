@@ -78,6 +78,10 @@ pub(crate) static CPU_PRIVILEGED_ENABLED: [AtomicBool; NUM_HART_MAX] =
 /// this flag (main.rs secondary-hart path).
 pub(crate) static IS_K1_PLATFORM: AtomicBool = AtomicBool::new(false);
 pub(crate) static IS_K3_PLATFORM: AtomicBool = AtomicBool::new(false);
+/// Whether the running platform is a SpacemiT K3.
+pub(crate) fn is_k3() -> bool {
+    IS_K3_PLATFORM.load(Ordering::Acquire)
+}
 
 /// Boot synchronization flag: set by the boot hart once platform
 /// initialization is complete, spinning secondary harts observe it with
@@ -118,14 +122,22 @@ pub(crate) fn publish_cpu_enabled(cpu_list: Option<CpuEnableList>) {
 ///
 /// Runs post-`READY` on the boot hart while other harts may read the table;
 /// the write lock makes their copies atomic snapshots of the whole list.
+///
+/// Union semantics: a hart whose privilege check has completed (and passed)
+/// is published as enabled; a hart whose check has *not* completed yet keeps
+/// its previous (DTB-derived) enabled state instead of being force-disabled.
+/// The boot hart runs this right after its own `check_privilege`, long before
+/// secondary harts reach theirs, so overwriting with `false` there would
+/// permanently mark every secondary hart as disabled and make the SBI HSM
+/// `hart_start` return `invalid_param` ("CPU1..15: failed to start").
 pub fn refresh_cpu_features() {
     let mut cpu_enabled = CPU_ENABLED.write();
     let Some(cpu_enabled) = cpu_enabled.as_mut() else {
         return;
     };
     for (hart_id, enabled) in cpu_enabled.iter_mut().enumerate() {
-        if *enabled {
-            *enabled = CPU_PRIVILEGED_ENABLED[hart_id].load(Ordering::Acquire);
+        if CPU_PRIVILEGED_ENABLED[hart_id].load(Ordering::Acquire) {
+            *enabled = true;
         }
     }
 }

@@ -12,6 +12,7 @@
 //! (`__smq_tx` / `__smq_rx`).
 
 use crate::message::MessageHeader;
+use log::{info, warn};
 
 /// Little-endian volatile 32-bit accessor.
 #[repr(transparent)]
@@ -100,6 +101,39 @@ impl SmqQueue {
         head == tail
     }
 
+    /// SpacemiT K3 L1 data-cache line size.
+    const CACHE_LINE_SIZE: usize = 64;
+
+    /// Clean and invalidate a data-cache range (`cbo.flush`), making writes
+    /// visible to the remote management processor (PuC). Mirrors OpenSBI
+    /// `csi_dcache_clean_invalid_range` / `__DCACHE_CIPA`.
+    unsafe fn dcache_clean_invalid_range(addr: usize, size: usize) {
+        core::arch::asm!("fence rw, rw");
+        let start = addr & !(Self::CACHE_LINE_SIZE - 1);
+        let end = addr + size;
+        let mut op = start;
+        while op < end {
+            core::arch::asm!("cbo.flush 0({})", in(reg) op);
+            op += Self::CACHE_LINE_SIZE;
+        }
+        core::arch::asm!("fence rw, rw");
+    }
+
+    /// Invalidate a data-cache range (`cbo.inval`) so the local hart reads
+    /// fresh data written by the remote PuC. Mirrors OpenSBI
+    /// `csi_dcache_invalid_range` / `__DCACHE_IPA`.
+    unsafe fn dcache_invalid_range(addr: usize, size: usize) {
+        core::arch::asm!("fence rw, rw");
+        let start = addr & !(Self::CACHE_LINE_SIZE - 1);
+        let end = addr + size;
+        let mut op = start;
+        while op < end {
+            core::arch::asm!("cbo.inval 0({})", in(reg) op);
+            op += Self::CACHE_LINE_SIZE;
+        }
+        core::arch::asm!("fence rw, rw");
+    }
+
     /// Enqueue a message into the ring.
     ///
     /// Writes the header and payload into the tail slot, publishes the
@@ -110,10 +144,25 @@ impl SmqQueue {
     ///
     /// `data.len()` must not exceed `slot_size - 8`.
     pub unsafe fn send(&self, header: &MessageHeader, data: &[u8], doorbell: Option<&Le32>) -> Result<(), ()> {
+        // Invalidate the PuC-written head (and our own tail) so the freed
+        // slots are visible before checking whether the queue is full.
+        // Mirrors OpenSBI `__smq_tx`'s `__DCACHE_IPA(headptr/tailptr)`.
+        Self::dcache_invalid_range(self.head as usize, core::mem::size_of::<Le32>());
+        Self::dcache_invalid_range(self.tail as usize, core::mem::size_of::<Le32>());
         if self.is_full() {
+            warn!(
+                "SMQ send FULL: token={} sg={} svc={} head={} tail={}",
+                header.token, header.servicegroup_id, header.service_id,
+                unsafe { &*self.head }.read(),
+                unsafe { &*self.tail }.read()
+            );
             return Err(());
         }
         if data.len() > self.slot_size - crate::message::RPMI_MSG_HDR_SIZE {
+            warn!(
+                "SMQ send TOO-BIG: token={} len={} slot={}",
+                header.token, data.len(), self.slot_size
+            );
             return Err(());
         }
 
@@ -139,13 +188,26 @@ impl SmqQueue {
             }
         }
 
-        // Make queue changes visible before publishing the tail index.
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // Make the message data visible to the PuC before publishing the tail.
+        Self::dcache_clean_invalid_range(slot as usize, self.slot_size);
+
+        // Publish the tail index.
         unsafe { &*self.tail }.write(((tail + 1) % self.num_slots) as u32);
+        // Flush the tail index so the PuC sees the new value.
+        Self::dcache_clean_invalid_range(self.tail as usize, core::mem::size_of::<Le32>());
 
         // Ring the doorbell if present.
         if let Some(db) = doorbell {
             db.write(1);
+            info!(
+                "SMQ send OK: tail={} token={} sg={} svc={} datalen={} db=0x{:x}",
+                tail,
+                header.token,
+                header.servicegroup_id,
+                header.service_id,
+                header.datalen,
+                db as *const _ as usize
+            );
         }
         Ok(())
     }
@@ -157,6 +219,8 @@ impl SmqQueue {
     /// Returns the number of payload bytes copied, or `Err(())` when no
     /// matching message is present.
     pub unsafe fn receive(&self, token: u16, out: &mut [u8]) -> Result<usize, ()> {
+        // Invalidate the PuC-written tail index and slots so we read fresh data.
+        Self::dcache_invalid_range(self.tail as usize, core::mem::size_of::<Le32>());
         if self.is_empty() {
             return Err(());
         }
@@ -167,6 +231,7 @@ impl SmqQueue {
         let mut pos = head;
         loop {
             let slot = unsafe { self.buffer.add(pos * self.slot_size) };
+            Self::dcache_invalid_range(slot as usize, self.slot_size);
             let slot_token = unsafe { (slot.add(6) as *const u16).read_volatile() };
             if u16::from_le(slot_token) == token {
                 break;
@@ -209,6 +274,9 @@ impl SmqQueue {
         // Publish the advanced head index.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         unsafe { &*self.head }.write(((head + 1) % self.num_slots) as u32);
+        // Flush the head index so the PuC sees the freed slot (mirrors
+        // OpenSBI `__DCACHE_CIPA(headptr)` in `__smq_rx`).
+        Self::dcache_clean_invalid_range(self.head as usize, core::mem::size_of::<Le32>());
         Ok(n)
     }
 
@@ -229,6 +297,7 @@ impl SmqQueue {
         msg_type: u8,
         out: &mut [u8],
     ) -> Result<usize, ()> {
+        Self::dcache_invalid_range(self.tail as usize, core::mem::size_of::<Le32>());
         if self.is_empty() {
             return Err(());
         }
@@ -239,6 +308,7 @@ impl SmqQueue {
         let mut pos = head;
         loop {
             let slot = unsafe { self.buffer.add(pos * self.slot_size) };
+            Self::dcache_invalid_range(slot as usize, self.slot_size);
             let sgid = unsafe { u16::from_le((slot as *const u16).read_volatile()) };
             let sid = unsafe { (slot.add(2) as *const u8).read_volatile() };
             let flags = unsafe { (slot.add(3) as *const u8).read_volatile() };
@@ -284,6 +354,9 @@ impl SmqQueue {
         // Publish the advanced head index.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         unsafe { &*self.head }.write(((head + 1) % self.num_slots) as u32);
+        // Flush the head index so the PuC sees the freed slot (mirrors
+        // OpenSBI `__DCACHE_CIPA(headptr)` in `__smq_rx`).
+        Self::dcache_clean_invalid_range(self.head as usize, core::mem::size_of::<Le32>());
         Ok(n)
     }
 }

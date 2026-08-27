@@ -121,8 +121,11 @@ pub fn init_board(fdt_address: usize) {
         spacemit_k3::cold_boot_allowed(crate::riscv::current_hartid());
 
         unsafe {
-            // Use the SBI link address as the warmboot entry
-            let warmboot_addr = crate::cfg::SBI_LINK_START_ADDRESS as u64;
+            // PMU-woken secondaries enter through the K3 warm entry
+            // (`_start_warm_k3`), which applies the OpenSBI `_start_warm`
+            // CSR sequence (PMACFG0, snoop, MSETUP caches, misa.H) before
+            // the AMO-based cold path runs.
+            let warmboot_addr = spacemit_k3::warm_entry();
             spacemit_k3::early_init(true, warmboot_addr);
         }
         info!("SpacemiT K3: early init done (RVBADDR + CCI-550 + A100 park)");
@@ -261,11 +264,28 @@ fn inject_rpmi_mailbox(root: &serde_device_tree::buildin::Node) {
                 )
             };
         }
-        // Doorbell register (db-reg).
-        let doorbell = ranges[4].start as *const rpmi::Le32;
+        // Doorbell register (db-reg). On the SpacemiT K3 the doorbell is
+        // triggered via a dedicated offset, and the mailbox interrupt must be
+        // enabled first (mirrors OpenSBI rpmi_shmem_transport_init).
+        const MAILBOX_DOORBALL_TRIGGER_OFFSET: usize = 0x40;
+        const MAILBOX_INT_EN_REG_OFFSET: usize = 0x118;
+        let doorbell_base = ranges[4].start;
+        // Enable the AP->PuC mailbox interrupt so the PuC is notified.
+        let int_en = (doorbell_base + MAILBOX_INT_EN_REG_OFFSET) as *const rpmi::Le32;
+        unsafe { (*int_en).write(1) };
+        let doorbell = (doorbell_base + MAILBOX_DOORBALL_TRIGGER_OFFSET) as *const rpmi::Le32;
         let mailbox = unsafe { rpmi::RpmiMailbox::new(slot_size, queues, Some(&*doorbell)) };
         // Leak the mailbox so the MPXY and CPPC extensions can share it.
         let mailbox: &'static rpmi::RpmiMailbox = Box::leak(Box::new(mailbox));
+        info!(
+            "RPMI mbox DIAG: slot={} a2p_req=0x{:x} p2a_ack=0x{:x} p2a_req=0x{:x} a2p_ack=0x{:x} db=0x{:x}",
+            slot_size,
+            ranges[RPMI_QUEUE_IDX_A2P_REQ].start,
+            ranges[RPMI_QUEUE_IDX_P2A_ACK].start,
+            ranges[RPMI_QUEUE_IDX_P2A_REQ].start,
+            ranges[RPMI_QUEUE_IDX_A2P_ACK].start,
+            ranges[4].start + MAILBOX_DOORBALL_TRIGGER_OFFSET
+        );
 
         if let Some(mpxy) = sbi::mpxy() {
             mpxy.set_mailbox(mailbox);

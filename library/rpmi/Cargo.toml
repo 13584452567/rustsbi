@@ -20,6 +20,7 @@ targets = [
 ]
 
 [dependencies]
+log = "0.4"
 
 [dev-dependencies]
 memoffset = "0.9.1"
