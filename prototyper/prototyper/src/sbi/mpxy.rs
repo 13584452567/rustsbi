@@ -5,7 +5,7 @@ use sbi_spec::binary::SharedPtr;
 use spin::Mutex;
 
 use rpmi::RpmiMailbox;
-use rpmi::message::{Error as RpmiError, servicegroup};
+use rpmi::message::servicegroup;
 
 /// SBI MPXY standard channel attribute IDs (sbi.h `enum sbi_mpxy_attribute_id`).
 mod channel_attr {
@@ -59,28 +59,6 @@ const CHANNELS: &[u16] = &[
     servicegroup::RTC,
     servicegroup::PWRKEY,
 ];
-
-/// Convert an RPMI error to an SBI return value (mirrors OpenSBI
-/// `rpmi_xlate_error`).
-fn rpmi_error_to_sbi(err: RpmiError) -> SbiRet {
-    match err {
-        RpmiError::Success => SbiRet::success(0),
-        RpmiError::Failed => SbiRet::failed(),
-        RpmiError::NotSupported => SbiRet::not_supported(),
-        RpmiError::InvalidParam => SbiRet::invalid_param(),
-        RpmiError::Denied => SbiRet::denied(),
-        RpmiError::InvalidAddr => SbiRet::invalid_address(),
-        RpmiError::Already => SbiRet::already_available(),
-        RpmiError::Extension => SbiRet::failed(),
-        RpmiError::HwFault => SbiRet::io(),
-        RpmiError::Busy => SbiRet::failed(),
-        RpmiError::InvalidState => SbiRet::invalid_state(),
-        RpmiError::BadRange => SbiRet::bad_range(),
-        RpmiError::Timeout => SbiRet::timeout(),
-        RpmiError::Io => SbiRet::io(),
-        RpmiError::NoData => SbiRet::failed(),
-    }
-}
 
 /// Implementation of SBI Message Proxy (MPXY) extension.
 ///
@@ -256,14 +234,6 @@ impl rustsbi::Mpxy for SbiMpxy {
         if !self.read_channel_attrs(channel_id, base_attribute_id, attribute_count, out) {
             return SbiRet::bad_range();
         }
-        if base_attribute_id == 0 && attribute_count >= 2 {
-            let v0 = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
-            let v1 = u32::from_le_bytes([out[4], out[5], out[6], out[7]]);
-            info!(
-                "MPXY read_attrs DIAG: chan={} shmem=0x{:x} attr0={} attr1(proto_ver)={:#x}",
-                channel_id, shmem, v0, v1
-            );
-        }
         SbiRet::success(0)
     }
 
@@ -318,32 +288,24 @@ impl rustsbi::Mpxy for SbiMpxy {
         let req = unsafe { core::slice::from_raw_parts(shmem as *const u8, message_data_len) };
         let mut resp = [0u8; RPMI_MAX_DATA_LEN as usize];
         match mbox.normal_request_with_status(channel_id as u16, service_id, req, &mut resp) {
-            Ok((RpmiError::Success, len)) => {
-                info!(
-                    "MPXY send DIAG: chan={} svc={} len={} resp0={} resp1={}",
-                    channel_id,
-                    service_id,
-                    len,
-                    u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]),
-                    u32::from_le_bytes([resp[4], resp[5], resp[6], resp[7]])
-                );
-                // Write the full [status][data] response back at offset 0x0;
-                // return the actual response length.
+            // A response was received. Write the full [status][data] response
+            // back at offset 0x0 and report SBI success. As in OpenSBI
+            // (sbi_mpxy_send_message -> __mpxy_mbox_send_message), the RPMI
+            // status embedded in the response is interpreted by the S-mode
+            // client and is NOT translated into an SBI ecall error. Doing so
+            // would make the Linux rpmi mailbox client treat benign statuses
+            // (e.g. RPMI_ERR_ALREADY from DOMAIN SET_STATE power-on) as a
+            // transport failure, breaking the power-domain driver.
+            Ok((_, len)) => {
                 unsafe {
                     core::ptr::copy_nonoverlapping(resp.as_ptr(), shmem as *mut u8, len);
                 }
                 SbiRet::success(len)
             }
-            Ok((err, _)) => {
-                warn!(
-                    "MPXY send DIAG: chan={} svc={} ERR={:?}",
-                    channel_id, service_id, err
-                );
-                rpmi_error_to_sbi(err)
-            }
+            // No acknowledgement received: the transfer itself failed.
             Err(()) => {
                 warn!(
-                    "MPXY send DIAG: chan={} svc={} TIMEOUT (no ack)",
+                    "MPXY send: channel {} service {} timed out (no ack)",
                     channel_id, service_id
                 );
                 SbiRet::timeout()

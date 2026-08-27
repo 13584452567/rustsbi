@@ -1319,6 +1319,98 @@ pub fn shutdown_process(hartid: usize) -> ! {
     }
 }
 
+/// Configure the M-level APLIC (maplic @0xf1800000) to delegate the wired
+/// IRQ range 1..=0x200 to the S-level APLIC (saplic), mirroring OpenSBI
+/// `aplic_cold_irqchip_init` for the K3 `riscv,delegate=<&saplic 0x1 0x200>`.
+///
+/// On the K3 the device IRQs physically enter the root maplic; without this
+/// delegation the interrupt signal stops at the maplic and never reaches the
+/// saplic, so no MSI is sent to the S-mode IMSIC and no SEIP is raised for
+/// Linux. This is the one firmware setup OpenSBI performs that RustSBI was
+/// missing.
+pub fn init_maplic_delegation() {
+    if !crate::platform::IS_K3_PLATFORM.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    /// M-level APLIC base (dts `interrupt-controller@f1800000`).
+    const MAPLIC_BASE: usize = 0xf180_0000;
+    const APLIC_DOMAINCFG: usize = 0x0000;
+    const APLIC_SOURCECFG_BASE: usize = 0x0004;
+    /// Delegation bit (aplic.h `APLIC_SOURCECFG_D`).
+    const APLIC_SOURCECFG_D: u32 = 1 << 10;
+    /// Child APLIC index for the saplic (first child = 0).
+    const CHILD_INDEX_SAPLIC: u32 = 0;
+    /// Delegate range from the K3 `riscv,delegate` property.
+    const FIRST_DELEG_IRQ: u32 = 1;
+    const LAST_DELEG_IRQ: u32 = 0x200;
+
+    #[inline]
+    fn wr(base: usize, off: usize, val: u32) {
+        unsafe { core::ptr::write_volatile((base + off) as *mut u32, val) }
+    }
+
+    const APLIC_CLRIE_BASE: usize = 0x1f00;
+    const APLIC_TARGET_BASE: usize = 0x3004;
+    const APLIC_MMSICFGADDR: usize = 0x1bc0;
+    const APLIC_MMSICFGADDRH: usize = 0x1bc4;
+    const APLIC_SMSICFGADDR: usize = 0x1bc8;
+    const APLIC_SMSICFGADDRH: usize = 0x1bcc;
+
+    #[inline]
+    fn rd(base: usize, off: usize) -> u32 {
+        unsafe { core::ptr::read_volatile((base + off) as *const u32) }
+    }
+
+    // Mirror OpenSBI `aplic_cold_irqchip_init` for the K3 maplic.
+    // 1. Domain configuration to 0 (interrupt domain disabled).
+    wr(MAPLIC_BASE, APLIC_DOMAINCFG, 0);
+    // 2. Disable all interrupt enables (CLRIE, 32 sources per word).
+    for i in (0..=LAST_DELEG_IRQ).step_by(32) {
+        wr(MAPLIC_BASE, APLIC_CLRIE_BASE + (i as usize / 32) * 4, u32::MAX);
+    }
+    // 3. Reset every source config and default priority, then delegate the
+    //    whole wired range 1..=0x200 to the saplic (D | child_index).
+    for i in FIRST_DELEG_IRQ..=LAST_DELEG_IRQ {
+        let src_off = APLIC_SOURCECFG_BASE + (i - 1) as usize * 4;
+        wr(MAPLIC_BASE, src_off, 0);
+        wr(MAPLIC_BASE, APLIC_TARGET_BASE + (i - 1) as usize * 4, 1);
+        wr(MAPLIC_BASE, src_off, APLIC_SOURCECFG_D | CHILD_INDEX_SAPLIC);
+    }
+    // 4. MSI target address configuration. Per the AIA spec these registers
+    //    live only in the root APLIC and provide the MSI write addresses for
+    //    the whole domain hierarchy: the saplic (MSI mode) composes its MSI
+    //    target address from the ROOT maplic's smsicfgaddr/smsicfgaddrh.
+    //    Without this the delegated interrupts are forwarded to the saplic,
+    //    the saplic fires MSIs to an unprogrammed address, and the S-mode
+    //    IMSIC never receives them (no SEIP for Linux).
+    //    Values derived from the U-Boot DTB (k3_com260_ifx.dtb), matching
+    //    OpenSBI `aplic_writel_msicfg`:
+    //    - mimsic@f1000000: hart-index-bits=4, guest-index-bits=0
+    //      -> mmsicfgaddr  = 0xf1000, mmsicfgaddrh = 0x4000 (LHXW=4)
+    //    - simsic@e0400000: hart-index-bits=4, guest-index-bits=6,
+    //      group-index-bits=0, group-index-shift=24
+    //      -> smsicfgaddr  = 0xe0400, smsicfgaddrh = 0x604000 (LHXW=4, LHXS=6)
+    //    Skip writes if the register pair is already locked (L bit set),
+    //    exactly like OpenSBI.
+    let m_h = rd(MAPLIC_BASE, APLIC_MMSICFGADDRH);
+    if m_h & (1 << 31) == 0 {
+        wr(MAPLIC_BASE, APLIC_MMSICFGADDR, 0x000f_1000);
+        wr(MAPLIC_BASE, APLIC_MMSICFGADDRH, 0x0000_4000);
+    }
+    let s_h = rd(MAPLIC_BASE, APLIC_SMSICFGADDRH);
+    if s_h & (1 << 31) == 0 {
+        wr(MAPLIC_BASE, APLIC_SMSICFGADDR, 0x000e_0400);
+        wr(MAPLIC_BASE, APLIC_SMSICFGADDRH, 0x0060_4000);
+    }
+    info!(
+        "[MAplic] delegated IRQ 1..=0x200 to saplic; msicfg m=0x{:x}/0x{:x} s=0x{:x}/0x{:x}",
+        rd(MAPLIC_BASE, APLIC_MMSICFGADDR),
+        rd(MAPLIC_BASE, APLIC_MMSICFGADDRH),
+        rd(MAPLIC_BASE, APLIC_SMSICFGADDR),
+        rd(MAPLIC_BASE, APLIC_SMSICFGADDRH)
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

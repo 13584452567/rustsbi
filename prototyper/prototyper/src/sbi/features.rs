@@ -338,41 +338,8 @@ pub fn configure_delegation_and_trap() {
                     stateen0 |= mstateen::AIA | mstateen::IMSIC | mstateen::SVSLCT;
                 }
                 mstateen::set_stateen0(stateen0);
-                info!(
-                    "mstateen0: present, wrote 0x{:x}, readback 0x{:x}",
-                    stateen0,
-                    mstateen::read_stateen0()
-                );
             } else {
                 warn!("mstateen0: CSR probe failed, NOT configured");
-            }
-            // Diagnostic: probe hstateen0 (0x60c) from M-mode. Linux sdtrig
-            // probes hstateen0 from S-mode and panics on illegal instruction
-            // even with mstateen0.STATEN set, so verify whether the CSR
-            // itself exists (M-mode read) and whether bit 57 (HSCONTEXT) is
-            // writable on K3.
-            let mut hstateen_info = TrapInfo::default();
-            let hstateen0_val = unsafe { csr_read_allow::<0x60c>(&mut hstateen_info) };
-            if hstateen_info.mcause == usize::MAX {
-                let mut hstateen_w = TrapInfo::default();
-                unsafe { csr_write_allow::<0x60c>(&mut hstateen_w, 1 << 57) };
-                let hstateen0_rb = if hstateen_w.mcause == usize::MAX {
-                    let mut hstateen_r = TrapInfo::default();
-                    unsafe { csr_read_allow::<0x60c>(&mut hstateen_r) }
-                } else {
-                    usize::MAX
-                };
-                info!(
-                    "hstateen0: present, read=0x{:x}, write-bit57-trap={}, readback=0x{:x}",
-                    hstateen0_val,
-                    hstateen_w.mcause != usize::MAX,
-                    hstateen0_rb
-                );
-            } else {
-                warn!(
-                    "hstateen0: M-mode probe trapped (mcause=0x{:x}), CSR likely absent",
-                    hstateen_info.mcause
-                );
             }
         }
         // Set up trap handling.

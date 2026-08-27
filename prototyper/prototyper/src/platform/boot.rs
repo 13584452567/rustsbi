@@ -129,6 +129,16 @@ pub fn init_board(fdt_address: usize) {
             spacemit_k3::early_init(true, warmboot_addr);
         }
         info!("SpacemiT K3: early init done (RVBADDR + CCI-550 + A100 park)");
+
+        // Delegate the M-level APLIC (maplic) wired IRQ range 1..=0x200 to
+        // the S-level APLIC (saplic), mirroring OpenSBI
+        // `aplic_cold_irqchip_init`. The device IRQs physically enter the
+        // root maplic; without this delegation the interrupt signal stops
+        // at the maplic and never reaches the saplic, so no MSI is sent to
+        // the S-mode IMSIC and no SEIP is raised for Linux. Must run after
+        // IS_K3_PLATFORM is recorded (the AIA init path runs earlier, before
+        // platform detection, so it cannot host this call).
+        spacemit_k3::init_maplic_delegation();
     } else if IS_K1_PLATFORM.load(Ordering::Acquire) {
         // Configure ML2SETUP for the boot hart
         spacemit_k1::cold_boot_allowed(crate::riscv::current_hartid());
@@ -277,15 +287,6 @@ fn inject_rpmi_mailbox(root: &serde_device_tree::buildin::Node) {
         let mailbox = unsafe { rpmi::RpmiMailbox::new(slot_size, queues, Some(&*doorbell)) };
         // Leak the mailbox so the MPXY and CPPC extensions can share it.
         let mailbox: &'static rpmi::RpmiMailbox = Box::leak(Box::new(mailbox));
-        info!(
-            "RPMI mbox DIAG: slot={} a2p_req=0x{:x} p2a_ack=0x{:x} p2a_req=0x{:x} a2p_ack=0x{:x} db=0x{:x}",
-            slot_size,
-            ranges[RPMI_QUEUE_IDX_A2P_REQ].start,
-            ranges[RPMI_QUEUE_IDX_P2A_ACK].start,
-            ranges[RPMI_QUEUE_IDX_P2A_REQ].start,
-            ranges[RPMI_QUEUE_IDX_A2P_ACK].start,
-            ranges[4].start + MAILBOX_DOORBALL_TRIGGER_OFFSET
-        );
 
         if let Some(mpxy) = sbi::mpxy() {
             mpxy.set_mailbox(mailbox);

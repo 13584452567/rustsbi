@@ -318,10 +318,6 @@ impl rustsbi::Hsm for SbiHsm {
                     if !crate::platform::is_k3() {
                         crate::sbi::ipi().unwrap().set_msip(hartid);
                     }
-                    info!(
-                        "HSM hart_start: hart {} -> 0x{:x} (wakeup+msip sent)",
-                        hartid, start_addr
-                    );
                     SbiRet::success(0)
                 } else {
                     warn!(

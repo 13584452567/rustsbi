@@ -8,7 +8,7 @@
 
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use log::{info, warn};
+use log::warn;
 
 use crate::message::{Error, MessageHeader, MessageType, RPMI_MSG_TOKEN_MASK};
 use crate::smq::{Le32, SmqQueue};
@@ -115,11 +115,6 @@ impl RpmiMailbox {
                 .send(&header, req, self.doorbell)
                 .map_err(|_| ())?;
         }
-        info!(
-            "RPMI send: sg={} svc={} token={} len={} db={:?}",
-            servicegroup_id, service_id, token, req.len(), self.doorbell_addr()
-        );
-
         // Wait for the acknowledgement carrying our token.
         let mut rx = [0u8; 256];
         for _ in 0..RPMI_DEF_RX_TIMEOUT {
@@ -127,10 +122,6 @@ impl RpmiMailbox {
             let n = unsafe { self.queues[queue_idx::P2A_ACK].receive(token, &mut rx) };
             if let Ok(n) = n {
                 let status = i32::from_le_bytes([rx[0], rx[1], rx[2], rx[3]]);
-                info!(
-                    "RPMI recv: sg={} svc={} token={} n={} status={:#x}",
-                    servicegroup_id, service_id, token, n, status as u32
-                );
                 // `rx` is the full acknowledgement payload
                 // [status(4)][response data]. Copy it wholesale so the caller
                 // sees the same layout OpenSBI's rpmi_normal_request_with_status
@@ -175,10 +166,6 @@ impl RpmiMailbox {
                 .send(&header, req, self.doorbell)
                 .map_err(|_| ())
         };
-        info!(
-            "RPMI posted: sg={} svc={} token={} len={} ok={}",
-            servicegroup_id, service_id, token, req.len(), r.is_ok()
-        );
         r
     }
 

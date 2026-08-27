@@ -12,7 +12,7 @@
 //! (`__smq_tx` / `__smq_rx`).
 
 use crate::message::MessageHeader;
-use log::{info, warn};
+use log::warn;
 
 /// Little-endian volatile 32-bit accessor.
 #[repr(transparent)]
@@ -199,15 +199,6 @@ impl SmqQueue {
         // Ring the doorbell if present.
         if let Some(db) = doorbell {
             db.write(1);
-            info!(
-                "SMQ send OK: tail={} token={} sg={} svc={} datalen={} db=0x{:x}",
-                tail,
-                header.token,
-                header.servicegroup_id,
-                header.service_id,
-                header.datalen,
-                db as *const _ as usize
-            );
         }
         Ok(())
     }
