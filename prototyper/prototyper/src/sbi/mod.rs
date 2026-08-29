@@ -2,11 +2,18 @@ use rustsbi::{RustSBI, SbiRet};
 use spin::Once;
 
 pub mod console;
+pub mod cppc;
+pub mod dbtr;
+pub mod fwft;
 pub mod hsm;
 pub mod ipi;
+pub mod mpxy;
+pub mod nacl;
 pub mod pmu;
 pub mod reset;
 pub mod rfence;
+pub mod sse;
+pub mod sta;
 pub mod suspend;
 
 pub mod early_trap;
@@ -19,11 +26,18 @@ pub mod trap;
 pub mod trap_stack;
 
 use console::SbiConsole;
+use cppc::SbiCppc;
+use dbtr::SbiDbtr;
+use fwft::SbiFwft;
 use hsm::SbiHsm;
 use ipi::SbiIpi;
+use mpxy::SbiMpxy;
+use nacl::SbiNacl;
 use pmu::SbiPmu;
 use reset::SbiReset;
 use rfence::SbiRFence;
+use sse::SbiSse;
+use sta::SbiSta;
 use suspend::SbiSuspend;
 
 #[derive(RustSBI, Default)]
@@ -43,6 +57,20 @@ pub struct SbiDispatcher {
     pmu: Option<SbiPmu>,
     #[rustsbi(susp)]
     susp: Option<SbiSuspend>,
+    #[rustsbi(fwft)]
+    fwft: Option<SbiFwft>,
+    #[rustsbi(dbtr)]
+    dbtr: Option<SbiDbtr>,
+    #[rustsbi(cppc)]
+    cppc: Option<SbiCppc>,
+    #[rustsbi(sse)]
+    sse: Option<SbiSse>,
+    #[rustsbi(mpxy)]
+    mpxy: Option<SbiMpxy>,
+    #[rustsbi(sta)]
+    sta: Option<SbiSta>,
+    #[rustsbi(nacl)]
+    nacl: Option<SbiNacl>,
 }
 
 impl SbiDispatcher {
@@ -56,6 +84,13 @@ impl SbiDispatcher {
         rfence: Option<SbiRFence>,
         susp: Option<SbiSuspend>,
         pmu: Option<SbiPmu>,
+        fwft: Option<SbiFwft>,
+        dbtr: Option<SbiDbtr>,
+        cppc: Option<SbiCppc>,
+        sse: Option<SbiSse>,
+        mpxy: Option<SbiMpxy>,
+        sta: Option<SbiSta>,
+        nacl: Option<SbiNacl>,
     ) -> Self {
         SbiDispatcher {
             console,
@@ -65,6 +100,13 @@ impl SbiDispatcher {
             rfence,
             pmu,
             susp,
+            fwft,
+            dbtr,
+            cppc,
+            sse,
+            mpxy,
+            sta,
+            nacl,
         }
     }
 }
@@ -113,6 +155,16 @@ pub(crate) fn rfence() -> Option<&'static SbiRFence> {
 /// Returns the pmu extension, if present.
 pub(crate) fn pmu() -> Option<&'static SbiPmu> {
     SBI_DISPATCHER.get().and_then(|sbi| sbi.pmu.as_ref())
+}
+
+/// Returns the mpxy extension, if present.
+pub(crate) fn mpxy() -> Option<&'static SbiMpxy> {
+    SBI_DISPATCHER.get().and_then(|sbi| sbi.mpxy.as_ref())
+}
+
+/// Returns the cppc extension, if present.
+pub(crate) fn cppc() -> Option<&'static SbiCppc> {
+    SBI_DISPATCHER.get().and_then(|sbi| sbi.cppc.as_ref())
 }
 
 /// Returns the susp extension, if present.

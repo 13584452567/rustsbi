@@ -239,6 +239,10 @@ impl BuildSpec {
         if self.features.iter().any(|feature| feature == "hypervisor") {
             flags.extend(["-C".to_string(), "target-feature=+h".to_string()]);
         }
+        // Zicbom (cache block operations) is required by the RPMI mailbox's
+        // shared-memory cache maintenance (cbo.flush / cbo.inval); always
+        // enable it for the firmware target.
+        flags.extend(["-C".to_string(), "target-feature=+zicbom".to_string()]);
         flags.extend([
             "-C".to_string(),
             format!("link-arg=-T{}", linker_script.display()),

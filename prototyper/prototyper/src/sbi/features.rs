@@ -105,6 +105,12 @@ pub fn extension_detection(cpus: &NodeSeq) {
                 Extension::Hypervisor if hart_id == current_hartid() => {
                     misa::read().has_extension('H')
                 }
+                // SpacemiT K3: `riscv,isa-extensions` in the DTB declares
+                // "ssaia" but omits "smaia", even though the hardware does
+                // implement M-level AIA (OpenSBI spacemit_k3 accesses
+                // CSR_MIREG/CSR_SIREG). Fall back to a CSR probe so the
+                // IMSIC-backed AIA path is not wrongly rejected.
+                Extension::Smaia => dt_supported || probe_smaia_csr(),
                 _ => dt_supported,
             };
         }
@@ -118,8 +124,6 @@ fn check_extension_in_device_tree(ext: &str, cpu: &crate::devicetree::Cpu) -> bo
     if let Some(isa_exts) = &cpu.isa_extensions {
         return isa_exts.iter().any(|e| e == ext);
     }
-
-    // Fallback to isa (take first string, default to empty)
     cpu.isa
         .iter()
         .next()
@@ -129,6 +133,21 @@ fn check_extension_in_device_tree(ext: &str, cpu: &crate::devicetree::Cpu) -> bo
                 .any(|part| part == ext || (ext.len() == 1 && part.contains(ext)))
         })
         .unwrap_or(false)
+}
+
+/// Probes whether M-level AIA (Smaia) is implemented by trying to read the
+/// `miselect` CSR (0x350). SpacemiT K3's DTB omits "smaia" from
+/// `riscv,isa-extensions` even though the hardware implements it (OpenSBI
+/// spacemit_k3 accesses CSR_MIREG/CSR_SIREG), so the DT check alone would
+/// wrongly reject the IMSIC-backed AIA path on K3.
+fn probe_smaia_csr() -> bool {
+    let mut trap_info = TrapInfo::default();
+    unsafe {
+        // miselect (0x350) is an M-level AIA selector CSR. If it does not
+        // exist, the expected-trap handler records mcause != usize::MAX.
+        csr_read_allow::<0x350>(&mut trap_info);
+        trap_info.mcause == usize::MAX
+    }
 }
 
 fn privileged_version_detection() {
@@ -235,15 +254,42 @@ fn has_mstateen0() -> bool {
 pub fn configure_delegation_and_trap() {
     unsafe {
         // Delegate all interrupts and exceptions to supervisor mode.
-        asm!("csrw mideleg,    {}", in(reg) !0);
+        // Mirror OpenSBI sbi_hart.c mstatus_init(): enable FPU (FS) and
+        // vector (VS) context for the next (supervisor) stage.
+        let mstatus_s = riscv::register::mstatus::read().bits();
+        let mut mstatus_set = mstatus_s;
+        if riscv::register::misa::read().has_extension('F')
+            || riscv::register::misa::read().has_extension('D')
+        {
+            mstatus_set |= 0b11 << 13; // MSTATUS_FS = 0b11 (full/dirty)
+        }
+        if riscv::register::misa::read().has_extension('V') {
+            mstatus_set |= 0b11 << 9; // MSTATUS_VS = 0b11 (full/dirty)
+        }
+        if mstatus_set != mstatus_s {
+            asm!("csrw mstatus, {}", in(reg) mstatus_set);
+        }
+
+        asm!("csrw mideleg,    {}", in(reg) ((1usize << 1) | (1usize << 5) | (1usize << 9))); // SSIP|STIP|SEIP
         asm!("csrw medeleg,    {}", in(reg) !0);
         asm!("csrw mcounteren, {}", in(reg) !0);
-        asm!("csrw scounteren, {}", in(reg) !0);
+        asm!("csrw scounteren, {}", in(reg) 7usize); // CY|TM|IR (OpenSBI mstatus_init)
         // Keep supervisor environment calls and illegal instructions in M-mode.
         medeleg::clear_supervisor_env_call();
         medeleg::clear_load_misaligned();
         medeleg::clear_store_misaligned();
         medeleg::clear_illegal_instruction();
+        // Keep load/store access faults in M-mode on K3. The K3 REGISTER_
+        // PRESERVATION window (0xd4282000-0xd4283000, PMP NONE) is accessed
+        // by U-Boot's early DM probes (reset/clk/qspi/eth); M-mode must
+        // service those faults through access_fault_handler, mirroring
+        // OpenSBI (medeleg excludes load/store access fault bits). Without
+        // this, the faults are delegated to S-mode U-Boot before its gd is
+        // initialized and the board silently hangs.
+        if crate::platform::IS_K3_PLATFORM.load(Ordering::Acquire) {
+            medeleg::clear_load_fault();
+            medeleg::clear_store_fault();
+        }
 
         let hart_priv_version = hart_privileged_version(current_hartid());
         if hart_priv_version >= PrivilegedVersion::Version1_11 {
@@ -251,18 +297,45 @@ pub fn configure_delegation_and_trap() {
         }
         if hart_priv_version >= PrivilegedVersion::Version1_12 {
             // Configure environment features based on available extensions.
+            // PBMTE (menvcfg bit 62, Svpbmt) is mandatory: K3's DTB declares
+            // "svpbmt", so Linux marks dma-noncoherent device mappings (e.g.
+            // AMBA/primecell ioremap) with the PTE PBMT field (bit 62). If
+            // menvcfg.PBMTE is 0, the S-mode MMU rejects any PTE with a
+            // non-zero PBMT field and raises a load page fault — this is the
+            // "Unable to handle kernel paging request" Oops in
+            // amba_read_periphid during of_platform_default_populate_init.
+            // OpenSBI sets ENVCFG_PBMTE when SVPBMT is present (sbi_hart.c);
+            // mirror that here unconditionally (K3 implements Svpbmt).
             if hart_extension_probe(current_hartid(), Extension::Sstc) {
                 menvcfg::set_bits(
-                    menvcfg::STCE | menvcfg::CBIE_INVALIDATE | menvcfg::CBCFE | menvcfg::CBZE,
+                    menvcfg::STCE
+                        | menvcfg::PBMTE
+                        | menvcfg::CBIE_INVALIDATE
+                        | menvcfg::CBCFE
+                        | menvcfg::CBZE,
                 );
             } else {
-                menvcfg::set_bits(menvcfg::CBIE_INVALIDATE | menvcfg::CBCFE | menvcfg::CBZE);
+                menvcfg::set_bits(
+                    menvcfg::PBMTE | menvcfg::CBIE_INVALIDATE | menvcfg::CBCFE | menvcfg::CBZE,
+                );
             }
-            if is_aia_active()
-                && hart_extension_probe(current_hartid(), Extension::Smaia)
-                && has_mstateen0()
-            {
-                mstateen::enable_smode_aia();
+            // Mirror OpenSBI sbi_hart.c mstateen setup: unconditionally grant
+            // S/HS-mode access to state-enable CSRs (STATEN), context CSRs
+            // and henvcfg once mstateen0 exists. Linux 6.18 probes hstateen0
+            // (0x60c) early during sdtrig init; without mstateen0.STATEN set,
+            // that S-mode access raises illegal instruction and panics the
+            // kernel ("Oops - illegal instruction" in
+            // sdtrig_percpu_csrs_check). AIA-related bits are added when the
+            // IMSIC-backed AIA path is active (K3 implements Smaia).
+            let mstateen_present = has_mstateen0();
+            if mstateen_present {
+                let mut stateen0 = mstateen::STATEN | mstateen::CONTEXT | mstateen::HSENVCFG;
+                if is_aia_active() && hart_extension_probe(current_hartid(), Extension::Smaia) {
+                    stateen0 |= mstateen::AIA | mstateen::IMSIC | mstateen::SVSLCT;
+                }
+                mstateen::set_stateen0(stateen0);
+            } else {
+                warn!("mstateen0: CSR probe failed, NOT configured");
             }
         }
         // Set up trap handling.

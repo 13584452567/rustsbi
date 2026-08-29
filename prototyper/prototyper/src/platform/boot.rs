@@ -1,14 +1,18 @@
 //! Safe boot entry points over the global platform state.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ops::Range;
 use core::sync::atomic::Ordering;
 
 use super::{
-    BOARD_INFO, BoardInfo, IS_K1_PLATFORM, READY, board_info, print_board_info, publish_cpu_enabled,
+    BOARD_INFO, BoardInfo, IS_K1_PLATFORM, IS_K3_PLATFORM, READY, board_info, print_board_info,
+    publish_cpu_enabled,
 };
 use crate::devicetree::{Tree, parse_device_tree};
 use crate::fail;
 use crate::riscv::spacemit_k1;
+use crate::riscv::spacemit_k3;
 use crate::sbi;
 use crate::sbi::SbiDispatcher;
 use crate::sbi::hsm::SbiHsm;
@@ -41,34 +45,101 @@ pub fn init_board(fdt_address: usize) {
     let susp = hsm.as_ref().map(|_| SbiSuspend);
     // Initialize pmu extension
     let pmu = sbi::pmu::init(&root);
+    // Initialize firmware features extension
+    let fwft = Some(sbi::fwft::SbiFwft);
+    // Initialize debug triggers extension
+    let dbtr = Some(sbi::dbtr::SbiDbtr);
+    // Initialize cppc extension
+    let cppc = Some(sbi::cppc::SbiCppc::new());
+    // Initialize supervisor software events extension
+    let sse = Some(sbi::sse::SbiSse);
+    // Initialize message proxy extension (RPMI mailbox backend injected by
+    // the platform; see sbi::mpxy::SbiMpxy::set_mailbox)
+    let mpxy = Some(sbi::mpxy::SbiMpxy::new());
+    // Initialize steal-time accounting extension (per-hart shared memory;
+    // reports zero steal time as this SBI never withholds virtual harts)
+    let sta = Some(sbi::sta::SbiSta);
+    // Initialize nested acceleration extension. The K3 implements the
+    // H-extension in hardware, so per SBI spec no NACL feature is available
+    // and the extension reports itself unavailable through `probe_extension`.
+    let nacl = Some(sbi::nacl::SbiNacl);
 
     // Publish the SBI extension set before the K1 detect / READY release,
     // so that harts observing `READY` also observe the published dispatcher.
-    sbi::SBI_DISPATCHER
-        .call_once(|| SbiDispatcher::new(console, ipi, hsm, reset, rfence, susp, pmu));
+    sbi::SBI_DISPATCHER.call_once(|| {
+        SbiDispatcher::new(
+            console, ipi, hsm, reset, rfence, susp, pmu, fwft, dbtr, cppc, sse, mpxy, sta, nacl,
+        )
+    });
+
+    // Inject the RPMI shared-memory mailbox (if the device tree carries a
+    // `riscv,rpmi-shmem-mbox` node) into the MPXY extension. Runs after the
+    // dispatcher is published so `sbi::mpxy()` is available.
+    inject_rpmi_mailbox(&root);
 
     // Publish the board facts before the K1 detect / READY release, so that
     // harts observing `READY` (Acquire) also observe the published board.
     BOARD_INFO.call_once(move || board);
 
-    // Record K1 platform detection *before* releasing the ready flag, so
-    // that secondary harts observing `READY` also observe the flag.
-    // Match the root node's `compatible` strings first (OpenSBI's
-    // spacemit_k1_match[] table), falling back to the model string.
-    let k1_platform = match root.get_prop("compatible") {
+    // Record K3/K1 platform detection *before* releasing the ready flag, so
+    // that secondary harts observing `READY` also observe the flags.
+    // K3 is checked first: its model strings ("SpacemiT K3 ...") also match
+    // the loose SpacemiT fallback used for K1 detection, so the K1 check
+    // runs only when the board is not a K3. This mirrors OpenSBI's
+    // platform_override match priority. Both check the root node's
+    // `compatible` strings first (OpenSBI's spacemit_k3_mach[] /
+    // spacemit_k1_match[] tables), falling back to the model string.
+    let k3_platform = match root.get_prop("compatible") {
         Some(prop) => {
             let seq = prop.deserialize::<serde_device_tree::buildin::StrSeq>();
-            spacemit_k1::is_k1_platform(&board_info().model, seq.iter())
+            spacemit_k3::is_k3_platform(&board_info().model, seq.iter())
         }
-        None => spacemit_k1::is_k1_platform(&board_info().model, core::iter::empty::<&str>()),
+        None => spacemit_k3::is_k3_platform(&board_info().model, core::iter::empty::<&str>()),
     };
-    IS_K1_PLATFORM.store(k1_platform, Ordering::Release);
+    IS_K3_PLATFORM.store(k3_platform, Ordering::Release);
+
+    if !k3_platform {
+        let k1_platform = match root.get_prop("compatible") {
+            Some(prop) => {
+                let seq = prop.deserialize::<serde_device_tree::buildin::StrSeq>();
+                spacemit_k1::is_k1_platform(&board_info().model, seq.iter())
+            }
+            None => spacemit_k1::is_k1_platform(&board_info().model, core::iter::empty::<&str>()),
+        };
+        IS_K1_PLATFORM.store(k1_platform, Ordering::Release);
+    }
 
     READY.store(true, Ordering::Release);
 
     print_board_info();
 
-    if IS_K1_PLATFORM.load(Ordering::Acquire) {
+    // SpacemiT K3 / K1 early initialization. The platform flags were
+    // already recorded before the ready flag was released, so they are
+    // visible here (and to secondary harts once they observe ready()).
+    if IS_K3_PLATFORM.load(Ordering::Acquire) {
+        // Configure ML2SETUP for the boot hart
+        spacemit_k3::cold_boot_allowed(crate::riscv::current_hartid());
+
+        unsafe {
+            // PMU-woken secondaries enter through the K3 warm entry
+            // (`_start_warm_k3`), which applies the OpenSBI `_start_warm`
+            // CSR sequence (PMACFG0, snoop, MSETUP caches, misa.H) before
+            // the AMO-based cold path runs.
+            let warmboot_addr = spacemit_k3::warm_entry();
+            spacemit_k3::early_init(true, warmboot_addr);
+        }
+        info!("SpacemiT K3: early init done (RVBADDR + CCI-550 + A100 park)");
+
+        // Delegate the M-level APLIC (maplic) wired IRQ range 1..=0x200 to
+        // the S-level APLIC (saplic), mirroring OpenSBI
+        // `aplic_cold_irqchip_init`. The device IRQs physically enter the
+        // root maplic; without this delegation the interrupt signal stops
+        // at the maplic and never reaches the saplic, so no MSI is sent to
+        // the S-mode IMSIC and no SEIP is raised for Linux. Must run after
+        // IS_K3_PLATFORM is recorded (the AIA init path runs earlier, before
+        // platform detection, so it cannot host this call).
+        spacemit_k3::init_maplic_delegation();
+    } else if IS_K1_PLATFORM.load(Ordering::Acquire) {
         // Configure ML2SETUP for the boot hart
         spacemit_k1::cold_boot_allowed(crate::riscv::current_hartid());
 
@@ -83,8 +154,25 @@ pub fn init_board(fdt_address: usize) {
 
 /// Runs the SoC-specific per-hart setup for secondary harts.
 pub fn secondary_hart_init() {
-    if IS_K1_PLATFORM.load(Ordering::Acquire) {
+    // SpacemiT K3: Configure ML2SETUP for this hart
+    if IS_K3_PLATFORM.load(Ordering::Acquire) {
+        spacemit_k3::cold_boot_allowed(crate::riscv::current_hartid());
+    } else if IS_K1_PLATFORM.load(Ordering::Acquire) {
+        // SpacemiT K1: Configure ML2SETUP for this hart
         spacemit_k1::cold_boot_allowed(crate::riscv::current_hartid());
+    }
+}
+
+/// SpacemiT platform hart-wakeup hook, called from HSM `hart_start`.
+///
+/// On the K3 a stopped hart may be powered down at the PMU; the software IPI
+/// (MSIP) alone cannot rouse it, so the hart's `PMU_CAP_CORE*_WAKEUP`
+/// register is asserted first (mirrors OpenSBI `spacemit_wakeup_core`,
+/// k3_corepm.c L1057-1113). Writing the wakeup register is benign for a hart
+/// that is already running.
+pub fn wakeup_hart(hartid: usize) {
+    if IS_K3_PLATFORM.load(Ordering::Acquire) {
+        spacemit_k3::wakeup_core(hartid);
     }
 }
 
@@ -92,6 +180,130 @@ pub fn secondary_hart_init() {
 pub fn wait_until_ready() {
     while !READY.load(Ordering::Acquire) {
         core::hint::spin_loop()
+    }
+}
+
+/// RPMI shared-memory queue slot layout (OpenSBI
+/// `include/sbi_utils/mailbox/rpmi_msgprot.h`).
+const RPMI_QUEUE_HEAD_SLOT: usize = 0;
+const RPMI_QUEUE_TAIL_SLOT: usize = 1;
+const RPMI_QUEUE_HEADER_SLOTS: usize = 2;
+const RPMI_QUEUE_IDX_A2P_REQ: usize = 0;
+const RPMI_QUEUE_IDX_P2A_ACK: usize = 1;
+const RPMI_QUEUE_IDX_P2A_REQ: usize = 2;
+const RPMI_QUEUE_IDX_A2P_ACK: usize = 3;
+
+/// Discovers the `riscv,rpmi-shmem-mbox` node in the device tree and
+/// injects the resulting shared-memory mailbox into the MPXY extension.
+///
+/// Mirrors OpenSBI `fdt_mailbox_rpmi_shmem.c`: the node carries a
+/// `riscv,slot-size` property and one `reg` region per queue (named by
+/// `reg-names`), plus a doorbell `db-reg`. Each queue stores its head and
+/// tail indices in the first two slots and the message ring after them.
+fn inject_rpmi_mailbox(root: &serde_device_tree::buildin::Node) {
+    let mut found = false;
+    let mut find = |node: &serde_device_tree::buildin::Node,
+                    _parent: Option<&serde_device_tree::buildin::Node>| {
+        if found {
+            return;
+        }
+        let Some(compatible) = node.get_prop("compatible") else {
+            return;
+        };
+        let seq = compatible.deserialize::<serde_device_tree::buildin::StrSeq>();
+        if !seq.iter().any(|s| s == "riscv,rpmi-shmem-mbox") {
+            return;
+        }
+        found = true;
+
+        // Slot size.
+        let Some(slot_size) = crate::platform::prop_u32_cells(node, "riscv,slot-size")
+            .and_then(|c| c.first().copied())
+            .map(|v| v as usize)
+        else {
+            warn!("rpmi-shmem-mbox: missing riscv,slot-size; skipping");
+            return;
+        };
+        if slot_size < 128 {
+            warn!("rpmi-shmem-mbox: slot-size too small; skipping");
+            return;
+        }
+
+        // reg regions in order (a2p-req, p2a-ack, p2a-req, a2p-ack, db-reg).
+        let Some(reg) = node.get_prop("reg") else {
+            warn!("rpmi-shmem-mbox: missing reg; skipping");
+            return;
+        };
+        let reg = reg.deserialize::<serde_device_tree::buildin::Reg>();
+        let ranges: Vec<_> = reg.iter().map(|r| r.0).collect();
+        if ranges.len() < 5 {
+            warn!("rpmi-shmem-mbox: expected 4 queues + db-reg; skipping");
+            return;
+        }
+
+        // Safety: the queue regions are MMIO shared memory owned by the
+        // platform; indices and slots are volatile little-endian words.
+        let mut queues = core::array::from_fn(|_| unsafe {
+            crate::rpmi::SmqQueue::new(
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+                slot_size,
+                0,
+            )
+        });
+        for (i, &idx) in [
+            RPMI_QUEUE_IDX_A2P_REQ,
+            RPMI_QUEUE_IDX_P2A_ACK,
+            RPMI_QUEUE_IDX_P2A_REQ,
+            RPMI_QUEUE_IDX_A2P_ACK,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let base = ranges[idx].start as *mut u8;
+            let size = ranges[idx].len();
+            let num_slots = (size - RPMI_QUEUE_HEADER_SLOTS * slot_size) / slot_size;
+            queues[i] = unsafe {
+                crate::rpmi::SmqQueue::new(
+                    base.add(RPMI_QUEUE_HEAD_SLOT * slot_size).cast(),
+                    base.add(RPMI_QUEUE_TAIL_SLOT * slot_size).cast(),
+                    base.add(RPMI_QUEUE_HEADER_SLOTS * slot_size),
+                    slot_size,
+                    num_slots,
+                )
+            };
+        }
+        // Doorbell register (db-reg). On the SpacemiT K3 the doorbell is
+        // triggered via a dedicated offset, and the mailbox interrupt must be
+        // enabled first (mirrors OpenSBI rpmi_shmem_transport_init).
+        const MAILBOX_DOORBALL_TRIGGER_OFFSET: usize = 0x40;
+        const MAILBOX_INT_EN_REG_OFFSET: usize = 0x118;
+        let doorbell_base = ranges[4].start;
+        // Enable the AP->PuC mailbox interrupt so the PuC is notified.
+        let int_en = (doorbell_base + MAILBOX_INT_EN_REG_OFFSET) as *const crate::rpmi::Le32;
+        unsafe { (*int_en).write(1) };
+        let doorbell =
+            (doorbell_base + MAILBOX_DOORBALL_TRIGGER_OFFSET) as *const crate::rpmi::Le32;
+        let mailbox = unsafe { crate::rpmi::RpmiMailbox::new(slot_size, queues, Some(&*doorbell)) };
+        // Leak the mailbox so the MPXY and CPPC extensions can share it.
+        let mailbox: &'static crate::rpmi::RpmiMailbox = Box::leak(Box::new(mailbox));
+
+        if let Some(mpxy) = sbi::mpxy() {
+            mpxy.set_mailbox(mailbox);
+            info!("SpacemiT: RPMI shared-memory mailbox injected");
+        }
+        // The CPPC extension shares the same mailbox backend.
+        if let Some(cppc) = sbi::cppc() {
+            cppc.set_mailbox(mailbox);
+        }
+    };
+    crate::devicetree::search_with_parent(root, &mut find);
+
+    if !found {
+        warn!(
+            "riscv,rpmi-shmem-mbox: node not found; RPMI mailbox not injected, MPXY/CPPC stay not supported"
+        );
     }
 }
 

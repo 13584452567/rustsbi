@@ -1,6 +1,9 @@
-use crate::{Console, Cppc, EnvInfo, Fence, Hsm, Ipi, Nacl, Pmu, Reset, Sta, Susp, Timer};
+use crate::{
+    Console, Cppc, Dbtr, EnvInfo, Fence, Fwft, Hsm, Ipi, Mpxy, Nacl, Pmu, Reset, Sta, Sse, Susp,
+    Timer,
+};
 use sbi_spec::{
-    binary::{CounterMask, HartMask, Physical, SbiRet, SharedPtr},
+    binary::{CounterMask, HartMask, Physical, SbiRet, SharedPtr, TriggerMask},
     nacl, pmu,
 };
 
@@ -601,6 +604,416 @@ impl EnvInfo for Forward {
             () => sbi_rt::get_mimpid(),
             #[cfg(not(feature = "forward"))]
             () => unimplemented!(),
+        }
+    }
+}
+
+impl Fwft for Forward {
+    #[inline]
+    fn set(&self, feature_id: u32, value: usize, flags: usize) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::fwft_set(feature_id, value, flags),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (feature_id, value, flags);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn get(&self, feature_id: u32) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::fwft_get(feature_id),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = feature_id;
+                unimplemented!()
+            }
+        }
+    }
+}
+
+impl Dbtr for Forward {
+    #[inline]
+    fn num_triggers(&self, trig_tdata1: usize) -> usize {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::debug_num_triggers(trig_tdata1),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = trig_tdata1;
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn set_shmem(&self, shmem: SharedPtr<u8>, flags: usize) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::debug_set_shmem(shmem, flags),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (shmem, flags);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn read_triggers(&self, trig_idx_base: usize, trig_count: usize) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::debug_read_triggers(trig_idx_base, trig_count),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (trig_idx_base, trig_count);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn install_triggers(&self, trig_count: usize) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::debug_install_triggers(trig_count),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = trig_count;
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn update_triggers(&self, trig_count: usize) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::debug_update_triggers(trig_count),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = trig_count;
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn uninstall_triggers(&self, triggers: TriggerMask) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::debug_uninstall_triggers(triggers),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = triggers;
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn enable_triggers(&self, triggers: TriggerMask) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::debug_enable_triggers(triggers),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = triggers;
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn disable_triggers(&self, triggers: TriggerMask) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::debug_disable_triggers(triggers),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = triggers;
+                unimplemented!()
+            }
+        }
+    }
+}
+
+impl Sse for Forward {
+    #[inline]
+    fn read_attrs(
+        &self,
+        event_id: u32,
+        base_attr_id: u32,
+        attr_count: u32,
+        output: SharedPtr<u8>,
+    ) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_read_attrs(event_id, base_attr_id, attr_count, output),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (event_id, base_attr_id, attr_count, output);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn write_attrs(
+        &self,
+        event_id: u32,
+        base_attr_id: u32,
+        attr_count: u32,
+        input: SharedPtr<u8>,
+    ) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_write_attrs(event_id, base_attr_id, attr_count, input),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (event_id, base_attr_id, attr_count, input);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn register(&self, event_id: u32, handler_entry_pc: usize, handler_entry_arg: usize) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_register(event_id, handler_entry_pc, handler_entry_arg),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (event_id, handler_entry_pc, handler_entry_arg);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn unregister(&self, event_id: u32) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_unregister(event_id),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = event_id;
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn enable(&self, event_id: u32) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_enable(event_id),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = event_id;
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn disable(&self, event_id: u32) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_disable(event_id),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = event_id;
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn complete(&self) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_complete(),
+            #[cfg(not(feature = "forward"))]
+            () => unimplemented!(),
+        }
+    }
+
+    #[inline]
+    fn inject(&self, event_id: u32, hart_id: usize) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_inject(event_id, hart_id),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (event_id, hart_id);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn hart_unmask(&self) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_hart_unmask(),
+            #[cfg(not(feature = "forward"))]
+            () => unimplemented!(),
+        }
+    }
+
+    #[inline]
+    fn hart_mask(&self) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::sse_hart_mask(),
+            #[cfg(not(feature = "forward"))]
+            () => unimplemented!(),
+        }
+    }
+}
+
+impl Mpxy for Forward {
+    #[inline]
+    fn get_shmem_size(&self) -> usize {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::mpxy_get_shmem_size(),
+            #[cfg(not(feature = "forward"))]
+            () => unimplemented!(),
+        }
+    }
+
+    #[inline]
+    fn set_shmem(&self, shmem: SharedPtr<u8>, flags: usize) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::mpxy_set_shmem(shmem, flags),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (shmem, flags);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn get_channel_ids(&self, start_index: u32) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::mpxy_get_channel_ids(start_index),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = start_index;
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn read_attributes(
+        &self,
+        channel_id: u32,
+        base_attribute_id: u32,
+        attribute_count: u32,
+        output: SharedPtr<u8>,
+    ) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::mpxy_read_attributes(
+                channel_id,
+                base_attribute_id,
+                attribute_count,
+                output,
+            ),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (channel_id, base_attribute_id, attribute_count, output);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn write_attributes(
+        &self,
+        channel_id: u32,
+        base_attribute_id: u32,
+        attribute_count: u32,
+        input: SharedPtr<u8>,
+    ) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::mpxy_write_attributes(
+                channel_id,
+                base_attribute_id,
+                attribute_count,
+                input,
+            ),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (channel_id, base_attribute_id, attribute_count, input);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn send_message_with_response(
+        &self,
+        channel_id: u32,
+        message_id: u32,
+        message_data_len: usize,
+    ) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => {
+                sbi_rt::mpxy_send_message_with_response(channel_id, message_id, message_data_len)
+            }
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (channel_id, message_id, message_data_len);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn send_message_without_response(
+        &self,
+        channel_id: u32,
+        message_id: u32,
+        message_data_len: usize,
+    ) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::mpxy_send_message_without_response(
+                channel_id,
+                message_id,
+                message_data_len,
+            ),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = (channel_id, message_id, message_data_len);
+                unimplemented!()
+            }
+        }
+    }
+
+    #[inline]
+    fn get_notification_events(&self, channel_id: u32) -> SbiRet {
+        match () {
+            #[cfg(feature = "forward")]
+            () => sbi_rt::mpxy_get_notification_events(channel_id),
+            #[cfg(not(feature = "forward"))]
+            () => {
+                let _ = channel_id;
+                unimplemented!()
+            }
         }
     }
 }

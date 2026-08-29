@@ -3,6 +3,8 @@ pub mod handler;
 
 mod helper;
 
+use core::sync::atomic::Ordering;
+
 use super::pmu::pmu_firmware_counter_increment;
 use crate::fail::unsupported_trap;
 
@@ -123,6 +125,16 @@ fn handle_exception(
             pmu_firmware_counter_increment(firmware_event::MISALIGNED_STORE);
             save_regs(&mut ctx);
             ctx.continue_with(handler::store_misaligned_handler, ())
+        }
+        // SpacemiT K3: S-mode accesses to the REGISTER_PRESERVATION window
+        // are PMP-denied and fault here; M-mode emulates them (see
+        // research doc §5.2 issue ①). Other platforms keep the previous
+        // unsupported-trap behavior.
+        Exception::LoadFault | Exception::StoreFault
+            if crate::platform::IS_K3_PLATFORM.load(Ordering::Acquire) =>
+        {
+            save_regs(&mut ctx);
+            ctx.continue_with(handler::access_fault_handler, ())
         }
         _ => {
             error!("Unhandled exception: {:?}", exception);

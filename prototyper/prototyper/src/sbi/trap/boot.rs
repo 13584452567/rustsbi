@@ -23,6 +23,11 @@ pub unsafe extern "C" fn boot() -> ! {
         "call   {boot_handler}",
         // Restore mepc
         "ld     t0, 0*8(sp)
+        li      t1, 1
+        csrw    0x5db, t1
+        csrr    t1, 0x7c1
+        ori     t1, t1, 1
+        csrw    0x7c1, t1
         csrw    mepc, t0",
         // Restore registers
         "ld      a0, 1*8(sp)",
@@ -54,6 +59,11 @@ pub extern "C" fn boot_handler(ctx: &mut BootContext) {
             sstatus::clear_sie();
             satp::write(satp::Satp::from_bits(0));
         }
+        // DEBUG: dump the first bytes at the jump target so we can verify
+        // whether SPL actually loaded U-Boot there (garbage/0xff => the
+        // load stage is the problem, not the SBI jump).
+        let target = unsafe { core::slice::from_raw_parts(start_addr as *const u8, 32) };
+        info!("Jump target @ 0x{:x}: {:02x?}", start_addr, target);
         ctx.a0 = current_hartid();
         ctx.a1 = opaque;
         ctx.mepc = start_addr;
@@ -63,9 +73,19 @@ pub extern "C" fn boot_handler(ctx: &mut BootContext) {
         Ok(next_stage) => {
             ipi::claim_ipi();
             unsafe {
-                mstatus::set_mpie();
+                // Align with OpenSBI sbi_hart_switch_mode: it sets
+                // MSTATUS_MPIE=0 before mret, so the next stage runs with
+                // MIE=0 (M-mode interrupts disabled). RustSBI previously
+                // called set_mpie() here, which left MIE=1 after mret and
+                // allowed M-level interrupts (e.g. a pending MSoft IPI) to
+                // fire during U-Boot's early boot. Clear the MPIE bit
+                // (mstatus bit 7) instead.
+                core::arch::asm!(
+                    "csrc mstatus, {}",
+                    in(reg) 1usize << 7,
+                    options(nomem, preserves_flags),
+                );
                 mstatus::set_mpp(next_stage.next_mode);
-                mie::set_msoft();
                 if !hart_extension_probe(current_hartid(), Extension::Sstc) {
                     mie::set_mtimer();
                 }

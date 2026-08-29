@@ -17,6 +17,8 @@ use riscv::register::{self, Permission};
 
 use crate::riscv::current_hartid;
 
+pub mod domain;
+
 /// Decides whether this hart leads the boot (designated in `DynamicInfo`,
 /// or raced when absent).
 fn is_work_hart(_dynamic_info_addr: usize) -> bool {
@@ -221,14 +223,19 @@ pub fn patch_device_tree(device_tree_ptr: usize) -> usize {
 
     let patched_length = serde_device_tree::ser::probe_dtb_length(&tree, &list).unwrap();
 
-    // We need aligned address here, so we use create u64 vec.
-    let patched_dtb_buffer = vec![0u64; patched_length.div_ceil(8)];
-    // Intentionally leak the buffer so that the patched DTB remains valid for the lifetime of the firmware.
-    // This is required because the returned pointer is used elsewhere and must not be deallocated.
-    let patched_dtb_buffer = patched_dtb_buffer.leak();
-    let mut patched_dtb_buffer_u8: &'static mut [u8] = unsafe {
-        core::slice::from_raw_parts_mut(patched_dtb_buffer.as_ptr() as *mut u8, patched_length)
+    // We need aligned address here. Place the patched DTB in the writable
+    // memory right after the SBI image instead of in the heap: the heap
+    // lives inside the SBI image, which the PMP marks read-only for
+    // S-mode, and U-Boot writes/relocates the DTB during early boot
+    // (fdt fixup). A PMP store fault there hangs U-Boot silently — OpenSBI
+    // keeps its FDT in writable memory, which is why the official chain
+    // boots. On K3 the gap [sbi_end, RCPU0) is RWX in the PMP layout.
+    let dtb_buf_addr = (sbi_end + 0xfff) & !0xfff;
+    let patched_dtb_buffer: &'static mut [u64] = unsafe {
+        core::slice::from_raw_parts_mut(dtb_buf_addr as *mut u64, patched_length.div_ceil(8))
     };
+    let mut patched_dtb_buffer_u8: &'static mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(dtb_buf_addr as *mut u8, patched_length) };
     serde_device_tree::ser::to_dtb(&tree, &list, &mut patched_dtb_buffer_u8).unwrap();
 
     // When AIA is active, NOP out M-level IMSIC and APLIC nodes in the
@@ -548,6 +555,112 @@ pub fn set_pmp(memory_range: &Range<usize>) {
         assert_eq!(RODATA_START_ADDRESS & 0x3, 0);
         assert_eq!(RODATA_END_ADDRESS & 0x3, 0);
 
+        // SpacemiT K3: re-lay the PMP table so the RCPU runtime windows
+        // (RCPU0/RCPU1 runtimes and the RCPU DTB) are NONE for S-mode, and
+        // the REGISTER_PRESERVATION window is NONE for S-mode so its
+        // loads/stores fault into the M-mode emulation path.
+        // Mirrors OpenSBI `sbi_domain_root_add_memrange(..., ENF_PERMISSIONS)`
+        // and `sbi_domain_root_add_memrange(REGISTER_PRESERVATION, M_RWX)`
+        // (spacemit_k3.c L178-196): the OS must not corrupt the RCPU
+        // (RT24/ESOS) environment, and S-mode REGISTER_PRESERVATION accesses
+        // are emulated by M-mode. PMP entries match lowest-index-first, so
+        // the table must be laid out with the NONE windows inline (a
+        // trailing entry cannot override an earlier RWX entry); see
+        // research doc §5.2 issue ③.
+        if crate::platform::IS_K3_PLATFORM.load(core::sync::atomic::Ordering::Acquire) {
+            use crate::riscv::spacemit_k3::{
+                RCPU_DTB_SPACE_BASE_ADDR, RCPU_DTB_SPACE_SIZE, RCPU0_RUNTIME_SPACE_BASE_ADDR,
+                RCPU0_RUNTIME_SPACE_SIZE, RCPU1_RUNTIME_SPACE_BASE_ADDR, RCPU1_RUNTIME_SPACE_SIZE,
+                REGISTER_PRESERVATION_SIZE,
+            };
+
+            let rcpu0_start = RCPU0_RUNTIME_SPACE_BASE_ADDR;
+            let rcpu0_end = RCPU0_RUNTIME_SPACE_BASE_ADDR + RCPU0_RUNTIME_SPACE_SIZE;
+            let rcpu1_start = RCPU1_RUNTIME_SPACE_BASE_ADDR;
+            let rcpu1_end = RCPU1_RUNTIME_SPACE_BASE_ADDR + RCPU1_RUNTIME_SPACE_SIZE;
+            let dtb_start = RCPU_DTB_SPACE_BASE_ADDR;
+            let dtb_end = RCPU_DTB_SPACE_BASE_ADDR + RCPU_DTB_SPACE_SIZE;
+            let reg_pres_start = crate::riscv::spacemit_k3::REGISTER_PRESERVATION_BASE;
+            let reg_pres_end =
+                reg_pres_start + crate::riscv::spacemit_k3::REGISTER_PRESERVATION_SIZE;
+
+            assert_eq!(rcpu0_start & 0x3, 0);
+            assert_eq!(rcpu0_end & 0x3, 0);
+            assert_eq!(rcpu1_start & 0x3, 0);
+            assert_eq!(rcpu1_end & 0x3, 0);
+            assert_eq!(dtb_start & 0x3, 0);
+            assert_eq!(dtb_end & 0x3, 0);
+            assert_eq!(reg_pres_start & 0x3, 0);
+            assert_eq!(reg_pres_end & 0x3, 0);
+
+            // pmpaddr0 = 0 (OFF entry)
+            pmpcfg0::set_pmp(0, Range::OFF, Permission::NONE, false);
+            pmpaddr0::write(0);
+
+            // [0..REGISTER_PRESERVATION] RWX / [REGISTER_PRESERVATION] NONE
+            // (M_RWX: M-mode keeps access so it can emulate S-mode accesses) /
+            // [REGISTER_PRESERVATION..memory_range.start] RWX. Programmed via
+            // the memory-domain PMP region API (issue #237 1-c).
+            let next = domain::program_windows(
+                1,
+                0,
+                memory_range.start,
+                &[domain::DomainRegion::new(
+                    reg_pres_start,
+                    REGISTER_PRESERVATION_SIZE,
+                    domain::M_RWX,
+                )],
+            )
+            .expect("K3 PMP table capacity");
+            assert_eq!(next, 4);
+
+            // [memory_range.start..sbi_start] RWX (K3 links at RAM base, so
+            // this window is typically empty — kept for symmetry)
+            pmpcfg0::set_pmp(4, Range::TOR, Permission::RWX, false);
+            pmpaddr4::write(SBI_START_ADDRESS >> 2);
+            // [sbi_start..sbi_rodata_start] R
+            pmpcfg0::set_pmp(5, Range::TOR, Permission::R, false);
+            pmpaddr5::write(RODATA_START_ADDRESS >> 2);
+            // [sbi_rodata_start..sbi_rodata_end] NONE
+            pmpcfg0::set_pmp(6, Range::TOR, Permission::NONE, false);
+            pmpaddr6::write(RODATA_END_ADDRESS >> 2);
+            // [sbi_rodata_end..sbi_end] R
+            pmpcfg0::set_pmp(7, Range::TOR, Permission::R, false);
+            pmpaddr7::write(SBI_END_ADDRESS >> 2);
+
+            // [sbi_end..RCPU0] RWX / RCPU0+RCPU1+DTB windows NONE-locked
+            // (ENF_PERMISSIONS: no R/W/X for M/S/U) / [DTB end..memory_end]
+            // RWX. Programmed via the memory-domain PMP region API.
+            let next = domain::program_windows(
+                8,
+                SBI_END_ADDRESS,
+                memory_range.end,
+                &[
+                    domain::DomainRegion::new(
+                        RCPU0_RUNTIME_SPACE_BASE_ADDR,
+                        RCPU0_RUNTIME_SPACE_SIZE,
+                        domain::ENF_PERMISSIONS,
+                    ),
+                    domain::DomainRegion::new(
+                        RCPU1_RUNTIME_SPACE_BASE_ADDR,
+                        RCPU1_RUNTIME_SPACE_SIZE,
+                        domain::ENF_PERMISSIONS,
+                    ),
+                    domain::DomainRegion::new(
+                        RCPU_DTB_SPACE_BASE_ADDR,
+                        RCPU_DTB_SPACE_SIZE,
+                        domain::ENF_PERMISSIONS,
+                    ),
+                ],
+            )
+            .expect("K3 PMP table capacity");
+            assert_eq!(next, 15);
+
+            // [memory_range.end..INF] RWX
+            domain::write_entry(15, Permission::RWX, false, usize::MAX);
+            return;
+        }
+
         // When AIA is active, block S-mode access to M-level interrupt
         // controller regions while keeping other low MMIO visible.
         // This matches OpenSBI's domain isolation approach.
@@ -626,6 +739,64 @@ pub fn set_pmp(memory_range: &Range<usize>) {
         pmpcfg0::set_pmp(7, Range::TOR, Permission::RWX, false);
         pmpaddr7::write(usize::MAX >> 2);
     }
+}
+
+/// Returns the firmware image's `[start, end)` physical range.
+///
+/// Reads the linker symbols `sbi_start`/`sbi_end` (defined in
+/// `prototyper/prototyper/rustsbi-prototyper.ld.in`). The range covers the
+/// `.text`/`.rodata`/`.data`/`.bss` sections, including the per-hart stacks
+/// and the SBI heap.
+pub(crate) fn sbi_image_range() -> core::ops::Range<usize> {
+    let start: usize;
+    let end: usize;
+    // Safety: `la` on a linker symbol has no memory side effects.
+    unsafe {
+        core::arch::asm!("la {}, sbi_start", out(reg) start, options(nomem));
+        core::arch::asm!("la {}, sbi_end", out(reg) end, options(nomem));
+    }
+    start..end
+}
+
+/// Checks whether the physical range `[addr, addr + len)` may be written by
+/// supervisor-mode software.
+///
+/// Shared-memory extensions (STA, NACL) hand the SBI a physical buffer that
+/// the SBI will later write on behalf of S-mode. The buffer must therefore
+/// not overlap memory owned by the firmware itself (which would let S-mode
+/// corrupt the SBI), nor the SpacemiT K3 protected windows that are PMP-denied
+/// for S-mode (RCPU runtimes, RCPU DTB, REGISTER_PRESERVATION).
+pub(crate) fn supervisor_writable(addr: usize, len: usize) -> bool {
+    let end = addr.saturating_add(len);
+
+    // Inside the SBI firmware image (text/rodata/data/bss, stacks, heap).
+    let image = sbi_image_range();
+    if addr < image.end && end > image.start {
+        return false;
+    }
+
+    // SpacemiT K3 PMP-denied windows (see `set_pmp`): never writable by
+    // S-mode, so pointing shared memory here would fault on the SBI write.
+    if crate::platform::IS_K3_PLATFORM.load(core::sync::atomic::Ordering::Acquire) {
+        use crate::riscv::spacemit_k3::{
+            RCPU_DTB_SPACE_BASE_ADDR, RCPU_DTB_SPACE_SIZE, RCPU0_RUNTIME_SPACE_BASE_ADDR,
+            RCPU0_RUNTIME_SPACE_SIZE, RCPU1_RUNTIME_SPACE_BASE_ADDR, RCPU1_RUNTIME_SPACE_SIZE,
+            REGISTER_PRESERVATION_BASE, REGISTER_PRESERVATION_SIZE,
+        };
+        for (start, size) in [
+            (RCPU0_RUNTIME_SPACE_BASE_ADDR, RCPU0_RUNTIME_SPACE_SIZE),
+            (RCPU1_RUNTIME_SPACE_BASE_ADDR, RCPU1_RUNTIME_SPACE_SIZE),
+            (RCPU_DTB_SPACE_BASE_ADDR, RCPU_DTB_SPACE_SIZE),
+            (REGISTER_PRESERVATION_BASE, REGISTER_PRESERVATION_SIZE),
+        ] {
+            let range_end = start.saturating_add(size);
+            if addr < range_end && end > start {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 /// For print PMP Permission.
