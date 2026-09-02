@@ -21,8 +21,8 @@ pub(crate) trait ResetDevice: Send {
 }
 
 pub(crate) const SIFIVE_TEST_COMPATIBLES: [&str; 1] = ["sifive,test0"];
-pub(crate) const P1_PMIC_COMPATIBLES: [&str; 2] = ["spacemit,p1", "ky,spm8821"];
-pub(crate) const PMIC_I2C_COMPATIBLES: [&str; 2] = ["spacemit,k1-i2c", "ky,i2c"];
+pub(crate) const P1_PMIC_COMPATIBLES: [&str; 3] = ["spacemit,p1", "spacemit,spm8821", "ky,spm8821"];
+pub(crate) const PMIC_I2C_COMPATIBLES: [&str; 3] = ["spacemit,k1-i2c", "spacemit,i2c", "ky,i2c"];
 
 pub(super) fn from_board(board: &BoardInfo) -> Option<Box<dyn ResetDevice>> {
     if let Some(base) = board.reset {

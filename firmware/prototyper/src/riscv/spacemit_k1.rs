@@ -94,13 +94,13 @@ pub fn is_k1_compatible(model: &str) -> bool {
 /// Check whether the device tree identifies a SpacemiT K1 / Ky X1 SoC.
 ///
 /// The root node's `compatible` strings
-/// (e.g. `"spacemit,k1"`, `"spacemit,k1-x"`) take priority,
+/// (e.g. `"spacemit,k1"`, `"spacemit,k1-x"`, `"ky,x1"`) take priority,
 /// with the `model` string as a fallback.
 #[inline]
 pub fn is_k1_platform<'a>(model: &str, compatibles: impl IntoIterator<Item = &'a str>) -> bool {
-    let by_compatible = compatibles
-        .into_iter()
-        .any(|c| c.to_ascii_lowercase().starts_with("spacemit,k1"));
+    let by_compatible = compatibles.into_iter().any(|c| {
+        c.eq_ignore_ascii_case("ky,x1") || c.to_ascii_lowercase().starts_with("spacemit,k1")
+    });
     by_compatible || is_k1_compatible(model)
 }
 
@@ -269,10 +269,11 @@ mod tests {
         assert!(is_k1_platform("", ["spacemit,k1x"]));
         assert!(is_k1_platform("", ["spacemit,k1-x"]));
         assert!(is_k1_platform("", ["spacemit,k1"]));
-        // Official OrangePi RV2 device tree: compatible + model.
+        assert!(is_k1_platform("", ["ky,x1"]));
+        // Vendor OrangePi RV2 device tree: compatible + model.
         assert!(is_k1_platform(
-            "OrangePi RV2",
-            ["xunlong,orangepi-rv2", "spacemit,k1"],
+            "ky x1 orangepi-rv2 board",
+            ["ky,x1", "riscv"],
         ));
         // Model fallback when no compatible matches.
         assert!(is_k1_platform("OrangePi RV2", ["sifive,fu740"]));
