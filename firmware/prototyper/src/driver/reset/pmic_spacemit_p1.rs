@@ -82,6 +82,7 @@ impl K1I2c {
 
     fn reset_controller(&self) {
         self.write(Reg::Icr, CR_UR);
+        self.clear_status(self.read(Reg::Isr));
         for _ in 0..32 {
             core::hint::spin_loop();
         }
@@ -92,10 +93,10 @@ impl K1I2c {
         self.write(Reg::Isr, status & SR_CLEAR_MASK);
     }
 
-    fn wait_for(&self, mask: u32) -> Option<u32> {
+    fn wait_for(&self, mask: u32, fatal_status: u32) -> Option<u32> {
         for _ in 0..I2C_WAIT_ITERATIONS {
             let status = self.read(Reg::Isr);
-            if status & (SR_ERR | SR_ACKNAK) != 0 {
+            if status & fatal_status != 0 {
                 self.clear_status(status);
                 self.reset_controller();
                 return None;
@@ -115,7 +116,6 @@ impl K1I2c {
         let reset_cycle = self.read(Reg::Ircr) | RCR_SDA_GLITCH_NOFIX;
         self.write(Reg::Ircr, reset_cycle);
         self.write(Reg::Icr, CR_GCD | CR_SCLE | CR_MSDE | CR_IUE);
-        self.clear_status(self.read(Reg::Isr));
 
         for _ in 0..I2C_WAIT_ITERATIONS {
             if self.read(Reg::Isr) & (SR_UB | SR_IBB) == 0 {
@@ -128,7 +128,7 @@ impl K1I2c {
     }
 
     fn disable(&self) {
-        self.write(Reg::Icr, self.read(Reg::Icr) & !CR_IUE);
+        self.write(Reg::Icr, self.read(Reg::Icr) & !(CR_IUE | CR_TRANSFER_MASK));
     }
 
     fn start(&self, device_addr: u8, read: bool) -> bool {
@@ -136,7 +136,7 @@ impl K1I2c {
         self.write(Reg::Idbr, address);
         let control = (self.read(Reg::Icr) & !CR_TRANSFER_MASK) | CR_START | CR_TB;
         self.write(Reg::Icr, control);
-        self.wait_for(SR_ITE).is_some()
+        self.wait_for(SR_ITE, SR_ERR | SR_ACKNAK).is_some()
     }
 
     fn send_byte(&self, value: u8, stop: bool) -> bool {
@@ -146,7 +146,8 @@ impl K1I2c {
             control |= CR_STOP;
         }
         self.write(Reg::Icr, control);
-        self.wait_for(if stop { SR_MSD } else { SR_ITE }).is_some()
+        self.wait_for(if stop { SR_MSD } else { SR_ITE }, SR_ERR | SR_ACKNAK)
+            .is_some()
     }
 
     fn write_reg(&self, device_addr: u8, reg: u8, value: u8) -> bool {
@@ -173,10 +174,10 @@ impl K1I2c {
             }
             let control = (self.read(Reg::Icr) & !CR_TRANSFER_MASK) | CR_ACKNAK | CR_STOP | CR_TB;
             self.write(Reg::Icr, control);
-            let status = self.wait_for(SR_IRF)?;
+            let status = self.wait_for(SR_IRF, SR_ERR)?;
             let value = self.read(Reg::Idbr) as u8;
             if status & SR_MSD == 0 {
-                self.wait_for(SR_MSD)?;
+                self.wait_for(SR_MSD, SR_ERR)?;
             }
             Some(value)
         })();
